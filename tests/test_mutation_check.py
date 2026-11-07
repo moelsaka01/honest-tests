@@ -125,7 +125,7 @@ class MutatorTests(unittest.TestCase):
 
     def test_js_generic_and_arrow_are_left_alone(self):
         src = "const f = (x: Array<number>): Promise<void> => x.length;\n"
-        labels = {s["label"] for s in mc.js_sites(src, None)}
+        labels = {s["label"] for s in mc.js_sites(src, None, ts=True)}
         self.assertFalse(any(l.startswith(("`<`", "`>`")) for l in labels))
 
     def test_is_test_file(self):

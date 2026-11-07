@@ -10,7 +10,7 @@ A survivor means no test would notice that bug.
     python mutation_check.py --base origin/main --cmd "pytest -q -x" --min-score 80
     python mutation_check.py --files pricing.py       # no git: mutate every line of these files
 
-Python is mutated through `ast`; JavaScript/TypeScript through a comment/string-aware line mutator.
+Python is mutated through `ast`; JavaScript/TypeScript through a tokenizer with bracket and statement structure.
 Standard library only. Python 3.9+. Source files are restored after every mutant, on errors, on
 Ctrl+C and on SIGTERM; after a SIGKILL run `--restore`. Provably equivalent mutants (identical
 bytecode) are skipped; others can be accepted with a reason in `.mutation-ignore`.
@@ -241,140 +241,445 @@ def py_apply(tree, site) -> str:
 
 
 # --------------------------------------------------------------------------- javascript mutator
+# A real tokenizer (strings, nested template literals, regex-vs-division, numbers, comments) with
+# bracket matching and statement boundaries (including automatic semicolon insertion). It is not a
+# complete ECMAScript/TypeScript grammar (see the README); every mutant is still validated before it
+# is allowed to count.
 
-RE_BEFORE_REGEX = re.compile(r"(?:^|[(,=:\[!&|?{};]|\breturn)\s*$")
-RE_LITERAL = re.compile(r"/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n\[])+/[a-z]*")
+TS_EXT = {".ts", ".tsx", ".mts", ".cts"}
+_JS_PUNCT = sorted(
+    "... === !== **= <<= &&= ||= ??= => == != <= >= && || ?? ?. ++ -- += -= *= /= %= &= |= ^= << ** "
+    "( ) [ ] { } ; , < > + - * / % & | ^ ! ~ ? : = . @".split(), key=len, reverse=True)
+_RE_ID = re.compile(r"[A-Za-z_$#\u0080-￿][\w$\u0080-￿]*")
+_RE_NUM = re.compile(r"0[xX][\da-fA-F_]+n?|0[bB][01_]+n?|0[oO][0-7_]+n?|"
+                     r"(?:\d[\d_]*(?:\.[\d_]*)?|\.\d[\d_]*)(?:[eE][+-]?\d+)?n?")
+_REGEX_AFTER = {"return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case",
+                "do", "else", "yield", "await"}
+_OPERATOR_WORDS = _REGEX_AFTER | {"import", "export", "function", "extends", "as", "satisfies", "default"}
+_TYPE_WORDS = {"void", "string", "number", "boolean", "any", "unknown", "never", "object", "bigint",
+               "symbol"}
+_BIN = {"===": ["!=="], "!==": ["==="], "==": ["!="], "!=": ["=="],
+        "<": [">=", "<="], "<=": [">", "<"], ">": ["<=", ">="], ">=": ["<", ">"],
+        "&&": ["||"], "||": ["&&"], "+=": ["-="], "-=": ["+="],
+        "+": ["-"], "-": ["+"], "*": ["/"], "/": ["*"], "%": ["*"]}
+_NEEDS_OPERANDS = {"<", "<=", ">", ">=", "+", "-", "*", "/", "%"}
+_CONT_START = {".", "?.", "?", ":", "&&", "||", "??", "==", "===", "!=", "!==", "<", ">", "<=", ">=", "*",
+               "/", "%", "=", "+=", "-=", "*=", "/=", "%=", "|", "&", "^", "+", "-", "(", "[", ",",
+               "=>", "**"}
+_GENERIC_OK = {",", ".", "[", "]", "|", "&", "?", ":", "<", ">", "=>", "(", ")", "{", "}", "...", "*", "="}
+_GENERIC_AFTER = {"(", ")", ",", ";", "=", "[", ".", "{", "|", "&", ":", ">", "=>", "?", "}"}
 
 
-def mask_js(lines: list) -> list:
-    """Blank out comments, strings and template literals (same length) so regexes only see code."""
-    masked = []
-    in_block = in_tpl = False
-    for line in lines:
-        out = []
-        i, n, quote = 0, len(line), None
-        while i < n:
-            c = line[i]
-            if in_block:
-                if line.startswith("*/", i):
-                    out.append("__"); i += 2; in_block = False
-                else:
-                    out.append("_"); i += 1
-            elif in_tpl or quote:
-                if c == "\\":
-                    out.append("_" * min(2, n - i)); i += 2
-                elif (in_tpl and c == "`") or (quote and c == quote):
-                    out.append("_"); i += 1; in_tpl = False; quote = None
-                else:
-                    out.append("_"); i += 1
-            elif line.startswith("//", i):
-                out.append("_" * (n - i)); i = n
-            elif c == "/" and RE_BEFORE_REGEX.search(line[:i]) and (m := RE_LITERAL.match(line, i)):
-                out.append("_" * len(m.group(0))); i += len(m.group(0))  # regex literal
-            elif line.startswith("/*", i):
-                out.append("__"); i += 2; in_block = True
-            elif c in "\"'":
-                quote = c; out.append("_"); i += 1
-            elif c == "`":
-                in_tpl = True; out.append("_"); i += 1
+class _Tok:
+    __slots__ = ("k", "t", "a", "b", "line", "nl")
+
+    def __init__(self, k, t, a, b, line, nl):
+        self.k, self.t, self.a, self.b, self.line, self.nl = k, t, a, b, line, nl
+
+
+def js_lex(src: str) -> list:
+    """Tokens: id, num, str, re, tpl (template chunk) and p (punctuator). Comments are dropped."""
+    toks, stack = [], []
+    i, n, line, nl = 0, len(src), 1, False
+
+    def regex_ok():
+        if not toks:
+            return True
+        p = toks[-1]
+        if p.k == "p":
+            return p.t not in (")", "]", "}")
+        if p.k == "id":
+            return p.t in _REGEX_AFTER
+        if p.k == "tpl":
+            return not p.t.endswith("`")
+        return False
+
+    def tpl_chunk(j):
+        while j < n:
+            ch = src[j]
+            if ch == "\\":
+                j += 2
+            elif ch == "`":
+                return min(j + 1, n), True
+            elif ch == "$" and src.startswith("${", j):
+                return j + 2, False
             else:
-                out.append(c); i += 1
-        masked.append("".join(out))
-    return masked
+                j += 1
+        return n, True
 
+    def emit(kind, a, b):
+        nonlocal line, nl
+        text = src[a:b]
+        toks.append(_Tok(kind, text, a, b, line, nl))
+        nl = False
+        line += text.count("\n")
 
-def _balanced(s: str) -> bool:
-    depth = 0
-    for ch in s:
-        if ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth -= 1
-            if depth < 0:
-                return False
-    return depth == 0
-
-
-JS_TOKEN_RULES = [
-    (re.compile(r"(?<=\s)(===|!==|==|!=)(?=\s)"),
-     {"===": ["!=="], "!==": ["==="], "==": ["!="], "!=": ["=="]}),
-    (re.compile(r"(?<=\s)(<=|>=|<|>)(?=\s)"),
-     {"<": [">=", "<="], "<=": [">", "<"], ">": ["<=", ">="], ">=": ["<", ">"]}),
-    (re.compile(r"(?<=\s)(&&|\|\|)(?=\s)"), {"&&": ["||"], "||": ["&&"]}),
-    (re.compile(r"(?<=\s)(\+=|-=)(?=\s)"), {"+=": ["-="], "-=": ["+="]}),
-    (re.compile(r"(?<=\s)([+\-*/])(?=\s)"), {"+": ["-"], "-": ["+"], "*": ["/"], "/": ["*"]}),
-    (re.compile(r"\b(true|false)\b"), {"true": ["false"], "false": ["true"]}),
-]
-JS_NUM = re.compile(r"(?<![\w.$#])(\d+(?:\.\d+)?)(?![\w.])")
-JS_IF = re.compile(r"^(\s*(?:\}\s*else\s+)?if\s*)\((.*)\)(\s*\{?\s*)$")
-JS_RETURN = re.compile(r"^(\s*)return\s+(.*?)\s*;?\s*$")
-JS_CALL = re.compile(r"^(\s*)(?:await\s+)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\(.*\)\s*;?\s*$")
-JS_IMPORT = re.compile(r"^\s*(?:import\b|export\s+(?:\*|\{[^}]*\})\s*from\b|.*\brequire\()")
-
-
-def js_sites(src: str, changed) -> list:
-    raw = src.split("\n")
-    lines = [l[:-1] if l.endswith("\r") else l for l in raw]
-    masked = mask_js(lines)
-    sites = []
-    for i, (orig, m) in enumerate(zip(lines, masked)):
-        ln = i + 1
-        if changed is not None and ln not in changed:
-            continue
-        if not m.strip() or "pragma: no mutate" in orig or JS_IMPORT.match(m):
-            continue
-        found = []
-
-        def splice(a, b, text, label):
-            found.append((label, orig[:a] + text + orig[b:]))
-
-        for rx, table in JS_TOKEN_RULES:
-            for mt in rx.finditer(m):
-                for new in table[mt.group(1)]:
-                    splice(mt.start(1), mt.end(1), new, f"`{mt.group(1)}` -> `{new}`")
-        for mt in JS_NUM.finditer(m):
-            v = mt.group(1)
-            if "." in v:
-                splice(mt.start(1), mt.end(1), repr(float(v) + 1), f"`{v}` -> `{float(v) + 1!r}`")
+    while i < n:
+        c = src[i]
+        if c == "\n":
+            line += 1
+            nl = True
+            i += 1
+        elif c.isspace() or c == "﻿":
+            i += 1
+        elif src.startswith("//", i):
+            j = src.find("\n", i)
+            i = n if j < 0 else j
+        elif src.startswith("/*", i):
+            j = src.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            if "\n" in src[i:j]:
+                nl = True
+                line += src.count("\n", i, j)
+            i = j
+        elif c in "'\"":
+            j = i + 1
+            while j < n and src[j] != c and src[j] != "\n":
+                j += 2 if src[j] == "\\" else 1
+            j = j + 1 if j < n and src[j] == c else min(j, n)
+            emit("str", i, j)
+            i = j
+        elif c == "`":
+            j, done = tpl_chunk(i + 1)
+            emit("tpl", i, j)
+            if not done:
+                stack.append("t")
+            i = j
+        elif c == "}" and stack and stack[-1] == "t":
+            stack.pop()
+            j, done = tpl_chunk(i + 1)
+            emit("tpl", i, j)
+            if not done:
+                stack.append("t")
+            i = j
+        elif c == "/" and regex_ok() and _regex_end(src, i) > 0:
+            j = _regex_end(src, i)
+            emit("re", i, j)
+            i = j
+        elif c.isdigit() or (c == "." and i + 1 < n and src[i + 1].isdigit()):
+            m = _RE_NUM.match(src, i)
+            emit("num", i, m.end())
+            i = m.end()
+        elif _RE_ID.match(src, i):
+            m = _RE_ID.match(src, i)
+            emit("id", i, m.end())
+            i = m.end()
+        else:
+            for p in _JS_PUNCT:
+                if src.startswith(p, i) and not (p == "?." and i + 2 < n and src[i + 2].isdigit()):
+                    break
             else:
-                splice(mt.start(1), mt.end(1), str(int(v) + 1), f"`{v}` -> `{int(v) + 1}`")
-                splice(mt.start(1), mt.end(1), str(int(v) - 1), f"`{v}` -> `{int(v) - 1}`")
-        mt = JS_IF.match(m)
-        if mt and _balanced(mt.group(2)) and mt.group(2).strip():
-            a, b = mt.start(2), mt.end(2)
-            found.append(("negate `if` condition", orig[:a] + "!(" + orig[a:b] + ")" + orig[b:]))
-        mt = JS_RETURN.match(m)
-        if mt and mt.group(2) and _balanced(mt.group(2)) \
-                and not re.search(r"[+\-*/&|?:=,(<>]$", mt.group(2)) \
-                and mt.group(2) not in ("undefined", "null"):
-            found.append(("`return <value>` -> `return undefined`",
-                          orig[:mt.end(1)] + "return undefined;"))
-        mt = JS_CALL.match(m)
-        if mt and mt.group(2) not in KEYWORDS and not NOISE_CALL.match(mt.group(2)) \
-                and _balanced(m):
-            found.append(("remove call statement", orig[:mt.end(1)] + ";"))
-        seen, uniq = set(), []
-        for label, new_line in found:
-            if (label, new_line) not in seen and new_line != orig:
-                seen.add((label, new_line))
-                uniq.append((label, new_line))
-        counts = {}
-        for label, _ in uniq:
-            counts[label] = counts.get(label, 0) + 1
-        nth = {}
-        for label, new_line in uniq:
-            nth[label] = nth.get(label, 0) + 1
-            shown = f"{label} (#{nth[label]})" if counts[label] > 1 else label
-            sites.append({"line": ln, "label": shown, "kind": "line", "new_line": new_line})
+                p = c
+            if p == "{":
+                stack.append("b")
+            elif p == "}" and stack:
+                stack.pop()
+            emit("p", i, i + len(p))
+            i += len(p)
+    return toks
+
+
+def _regex_end(src: str, i: int) -> int:
+    """End offset of a regex literal starting at src[i] == '/', or 0 if it is not one."""
+    n, j, in_class = len(src), i + 1, False
+    while j < n and src[j] != "\n":
+        ch = src[j]
+        if ch == "\\":
+            j += 2
+            continue
+        if ch == "[":
+            in_class = True
+        elif ch == "]":
+            in_class = False
+        elif ch == "/" and not in_class:
+            j += 1
+            while j < n and src[j].isalpha():
+                j += 1
+            return j if j > i + 2 else 0
+        j += 1
+    return 0
+
+
+def _opens(t) -> bool:
+    return (t.k == "p" and t.t in ("(", "[", "{")) or (t.k == "tpl" and t.t.endswith("${"))
+
+
+def _closes(t) -> bool:
+    return (t.k == "p" and t.t in (")", "]", "}")) or (t.k == "tpl" and t.t.startswith("}"))
+
+
+def _pairs(toks) -> dict:
+    match, st = {}, []
+    for i, t in enumerate(toks):
+        if _closes(t) and st:
+            j = st.pop()
+            match[i], match[j] = j, i
+        if _opens(t):
+            st.append(i)
+    return match
+
+
+def _ends_expr(p, brace: bool = False) -> bool:
+    """Can token p be the last token of an operand (so that a following operator is binary)?"""
+    if p.k in ("num", "str", "re"):
+        return True
+    if p.k == "tpl":
+        return p.t.endswith("`")
+    if p.k == "id":
+        return p.t not in _OPERATOR_WORDS
+    return p.t in (")", "]", "++", "--") or (brace and p.t == "}")
+
+
+def _starts_operand(t) -> bool:
+    if t.k in ("num", "str", "re", "id"):
+        return True
+    if t.k == "tpl":
+        return t.t.startswith("`")
+    return t.t in ("(", "[", "{", "!", "~", "-", "+", "++", "--")
+
+
+def _starts_cont(t) -> bool:
+    """Does t, at the start of a line, continue the previous expression (no semicolon inserted)?"""
+    if t.k == "p":
+        return t.t in _CONT_START
+    if t.k == "id":
+        return t.t in ("instanceof", "in", "as", "satisfies", "of")
+    return t.k == "tpl" and t.t.startswith("`")
+
+
+def _continues(prev, t) -> bool:
+    return not _ends_expr(prev, True) or _starts_cont(t)
+
+
+def _expr_end(toks, j: int, stop_comma: bool = False) -> int:
+    """Index one past the expression that starts at toks[j] (stops at ;, an unmatched closer, a
+    top-level comma when asked, or a line break that automatic semicolon insertion would split)."""
+    d, k = 0, j
+    while k < len(toks):
+        t = toks[k]
+        if _closes(t):
+            if d == 0:
+                return k
+            d -= 1
+        elif d == 0:
+            if t.k == "p" and (t.t == ";" or (stop_comma and t.t == ",")):
+                return k
+            if k > j and t.nl and not _continues(toks[k - 1], t):
+                return k
+        if _opens(t):
+            d += 1
+        k += 1
+    return k
+
+
+def _case_colon(toks, match, ci: int) -> bool:
+    k = ci - 1
+    while k >= 0:
+        t = toks[k]
+        if _closes(t) and k in match:
+            k = match[k] - 1
+            continue
+        if _opens(t) or (t.k == "p" and t.t in (";", "{", "}", "?")):
+            return False
+        if t.k == "id" and t.t in ("case", "default"):
+            return True
+        k -= 1
+    return False
+
+
+def _stmt_start(toks, match, i: int) -> bool:
+    if i == 0:
+        return True
+    p, t = toks[i - 1], toks[i]
+    if p.k == "p" and p.t in (";", "{", "}"):
+        return True
+    if p.k == "p" and p.t == ")":
+        o = match.get(i - 1)
+        if o and toks[o - 1].k == "id" and toks[o - 1].t in ("if", "for", "while", "with"):
+            return True
+    if p.k == "id" and p.t in ("else", "do"):
+        return True
+    if p.k == "p" and p.t == ":" and _case_colon(toks, match, i - 1):
+        return True
+    return t.nl and not _continues(p, t)
+
+
+def _skipped(toks, match, ts: bool) -> set:
+    """Token indexes that are not runtime code: imports, re-exports, and TypeScript-only statements."""
+    skip = set()
+    for i, t in enumerate(toks):
+        if t.k != "id" or i in skip or not _stmt_start(toks, match, i):
+            continue
+        nxt = toks[i + 1] if i + 1 < len(toks) else None
+        nxt2 = toks[i + 2] if i + 2 < len(toks) else None
+        hit = False
+        if t.t == "import":
+            hit = nxt is not None and not (nxt.k == "p" and nxt.t in ("(", "."))
+        elif t.t == "export":
+            hit = nxt is not None and ((nxt.k == "p" and nxt.t in ("*", "{")) or
+                                       (ts and nxt.k == "id" and nxt.t in ("type", "interface", "declare")))
+        elif ts and t.t in ("interface", "declare"):
+            hit = nxt is not None and nxt.k == "id"
+        elif ts and t.t == "type":
+            hit = nxt is not None and nxt.k == "id" and nxt2 is not None and nxt2.t in ("=", "<")
+        if hit:
+            skip.update(range(i, _expr_end(toks, i)))
+    return skip
+
+
+def _generics(toks) -> set:
+    """TypeScript type-argument brackets such as Array<number> (so < and > are not mutated as comparisons)."""
+    out, n = set(), len(toks)
+    for i, t in enumerate(toks):
+        if i == 0 or i in out or not (t.k == "p" and t.t == "<"):
+            continue
+        p = toks[i - 1]
+        if not (p.k == "id" and p.b == t.a):
+            continue
+        d, k, found = 0, i, None
+        while k < n:
+            u = toks[k]
+            if u.k == "p" and u.t == "<":
+                d += 1
+            elif u.k == "p" and u.t == ">":
+                d -= 1
+                if d == 0:
+                    found = k
+                    break
+            elif not (u.k in ("id", "num", "str") or (u.k == "p" and u.t in _GENERIC_OK)):
+                break
+            k += 1
+        if found is None:
+            continue
+        after = toks[found + 1] if found + 1 < n else None
+        if after is None or after.nl or (after.k == "p" and after.t in _GENERIC_AFTER):
+            out.update(x for x in range(i, found + 1) if toks[x].k == "p" and toks[x].t in ("<", ">"))
+    return out
+
+
+def _call_stmt(toks, match, i: int):
+    """If a call statement (`[await] a.b.c(...)`) starts at toks[i], return (dotted name, index of `)`)."""
+    j = i + 1 if toks[i].t == "await" else i
+    parts = []
+    while j < len(toks) and toks[j].k == "id":
+        parts.append(toks[j].t)
+        j += 1
+        if j < len(toks) and toks[j].k == "p" and toks[j].t in (".", "?."):
+            parts.append(".")
+            j += 1
+        else:
+            break
+    if not parts or parts[-1] == "." or j >= len(toks) or toks[j].t != "(" or j not in match:
+        return None
+    m = match[j]
+    nxt = toks[m + 1] if m + 1 < len(toks) else None
+    if nxt is not None and not (nxt.k == "p" and nxt.t in (";", "}")) and not (nxt.nl and not _starts_cont(nxt)):
+        return None
+    return "".join(parts), m
+
+
+def js_sites(src: str, changed, ts: bool = False) -> list:
+    toks = js_lex(src)
+    match = _pairs(toks)
+    lines = src.split("\n")
+    skip = _skipped(toks, match, ts)
+    generic = _generics(toks) if ts else set()
+    for_hdr = set()
+    for i, t in enumerate(toks):
+        if t.k == "id" and t.t == "for" and i + 1 < len(toks) and (i + 1) in match:
+            for_hdr.update(range(i + 1, match[i + 1] + 1))
+    cands = []
+
+    def add(line, label, edits):
+        if changed is not None and line not in changed:
+            return
+        if line <= len(lines) and "pragma: no mutate" in lines[line - 1]:
+            return
+        cands.append((line, label, tuple(edits)))
+
+    def body_edit(first, end):
+        text = src[toks[first].a:toks[end - 1].b].strip()
+        if text in ("undefined", "null", "void 0"):
+            return None
+        return (toks[first].a, toks[end - 1].b, "undefined")
+
+    for i, t in enumerate(toks):
+        if i in skip:
+            continue
+        prev = toks[i - 1] if i else None
+        nxt = toks[i + 1] if i + 1 < len(toks) else None
+        if t.k == "p":
+            op = t.t
+            if op in _BIN:
+                if i in generic:
+                    continue
+                if op in _NEEDS_OPERANDS and not (prev and _ends_expr(prev) and nxt and _starts_operand(nxt)):
+                    continue
+                for new in _BIN[op]:
+                    add(t.line, f"`{op}` -> `{new}`", [(t.a, t.b, new)])
+            elif op == "!" and (prev is None or not _ends_expr(prev, True)) and nxt and _starts_operand(nxt):
+                add(t.line, "remove `!`", [(t.a, t.b, "")])
+            elif op in ("++", "--") and i not in for_hdr:
+                new = "--" if op == "++" else "++"
+                add(t.line, f"`{op}` -> `{new}`", [(t.a, t.b, new)])
+            elif op == "=>" and nxt and not (nxt.k == "p" and nxt.t == "{") \
+                    and not (ts and nxt.k == "id" and nxt.t in _TYPE_WORDS):
+                e = _expr_end(toks, i + 1, True)
+                edit = body_edit(i + 1, e) if e > i + 1 else None
+                if edit:
+                    add(t.line, "arrow body -> `undefined`", [edit])
+        elif t.k == "num":
+            v = t.t
+            plain = re.fullmatch(r"\d+(?:\.\d+)?", v) and not (len(v) > 1 and v[0] == "0" and "." not in v)
+            key = nxt is not None and nxt.t == ":" and prev is not None and prev.t in ("{", ",")
+            if plain and not key and not (prev and prev.t == "."):
+                if "." in v:
+                    new = repr(float(v) + 1)
+                    add(t.line, f"`{v}` -> `{new}`", [(t.a, t.b, new)])
+                else:
+                    for d in (1, -1):
+                        new = str(int(v) + d)
+                        add(t.line, f"`{v}` -> `{new}`", [(t.a, t.b, f"({new})" if d < 0 and int(v) + d < 0 else new)])
+        elif t.k == "id":
+            if t.t in ("true", "false") and not (prev and prev.t == "."):
+                add(t.line, f"`{t.t}` -> `{'false' if t.t == 'true' else 'true'}`",
+                    [(t.a, t.b, "false" if t.t == "true" else "true")])
+            elif t.t == "if" and nxt and nxt.t == "(" and (i + 1) in match and match[i + 1] > i + 2:
+                o, c = nxt, toks[match[i + 1]]
+                add(t.line, "negate `if` condition", [(o.b, o.b, "!("), (c.a, c.a, ")")])
+            elif t.t == "return" and nxt and not nxt.nl and not (nxt.k == "p" and nxt.t in (";", "}")):
+                e = _expr_end(toks, i + 1)
+                edit = body_edit(i + 1, e) if e > i + 1 else None
+                if edit:
+                    add(t.line, "`return <value>` -> `return undefined`", [edit])
+            if t.t not in KEYWORDS and _stmt_start(toks, match, i):
+                cs = _call_stmt(toks, match, i)
+                if cs and cs[0].split(".")[0] not in KEYWORDS and not NOISE_CALL.match(cs[0]):
+                    end_tok = toks[cs[1]]
+                    follows = toks[cs[1] + 1] if cs[1] + 1 < len(toks) else None
+                    semi = follows is not None and follows.k == "p" and follows.t == ";"
+                    add(t.line, "remove call statement", [(t.a, end_tok.b, "" if semi else ";")])
+    seen, uniq = set(), []
+    for cnd in cands:
+        if cnd not in seen:
+            seen.add(cnd)
+            uniq.append(cnd)
+    uniq.sort(key=lambda c: c[0])
+    counts, nth, sites = {}, {}, []
+    for line, label, _ in uniq:
+        counts[(line, label)] = counts.get((line, label), 0) + 1
+    for line, label, edits in uniq:
+        nth[(line, label)] = nth.get((line, label), 0) + 1
+        shown = f"{label} (#{nth[(line, label)]})" if counts[(line, label)] > 1 else label
+        sites.append({"line": line, "label": shown, "kind": "edits", "edits": list(edits)})
     return sites
 
 
 def js_apply(src: str, site) -> str:
-    raw = src.split("\n")
-    i = site["line"] - 1
-    eol = "\r" if raw[i].endswith("\r") else ""
-    raw[i] = site["new_line"] + eol
-    return "\n".join(raw)
+    out = src
+    for a, b, text in sorted(site["edits"], reverse=True):
+        out = out[:a] + text + out[b:]
+    return out
 
 
 # --------------------------------------------------------------------------- running tests
@@ -742,7 +1047,8 @@ def main(argv=None) -> int:
     for rel, path, lang, lines in targets:
         try:
             src = path.read_bytes().decode("utf-8")
-            sites = py_sites(src, lines) if lang == "py" else js_sites(src, lines)
+            sites = (py_sites(src, lines) if lang == "py"
+                     else js_sites(src, lines, ts=path.suffix.lower() in TS_EXT))
         except (SyntaxError, UnicodeDecodeError, ValueError) as e:
             skipped_files.append((rel, str(e).splitlines()[0] if str(e) else type(e).__name__))
             continue

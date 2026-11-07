@@ -115,6 +115,35 @@ class CrashRecoveryTests(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_sigterm_handler_restores_on_every_platform(self):
+        """Windows cannot deliver SIGTERM from another process, but Python's handler is real there:
+        raise it from inside the run, while a mutant is on disk, and check the file comes back."""
+        d, original = self._project()
+        harness = d / "harness.py"
+        try:
+            harness.write_text(
+                "import signal, sys\n"
+                f"sys.path.insert(0, {str(_paths.MUTATION_CHECK.parent)!r})\n"
+                "import mutation_check as mc\n"
+                "real, calls = mc.run_cmd, []\n"
+                "def fake(cmd, cwd, timeout):\n"
+                "    calls.append(1)\n"
+                "    if len(calls) == 2:  # call 1 is the baseline, call 2 runs the first mutant\n"
+                "        print('mutant on disk:', (cwd / 'm.py').read_bytes() != ORIGINAL, flush=True)\n"
+                "        signal.raise_signal(signal.SIGTERM)\n"
+                "    return real(cmd, cwd, timeout)\n"
+                "mc.run_cmd = fake\n"
+                f"ORIGINAL = {original!r}\n"
+                f"sys.exit(mc.main(['--files', 'm.py', '--cmd', {SLOW_CMD!r}]))\n", encoding="utf-8")
+            proc = subprocess.run([sys.executable, str(harness)], cwd=d, capture_output=True, text=True,
+                                  timeout=120)
+            self.assertEqual(proc.returncode, 143, proc.stdout + proc.stderr)
+            self.assertIn("mutant on disk: True", proc.stdout)
+            self.assertEqual((d / "m.py").read_bytes(), original)
+            self.assertNotIn("WARNING", proc.stderr)  # restored cleanly, backups removed
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_hard_kill_then_restore_flag(self):
         d, original = self._project()
         try:
