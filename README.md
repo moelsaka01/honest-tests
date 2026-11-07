@@ -8,7 +8,7 @@ Agent skills that stop Claude Code, Codex, and Cursor from shipping tests that p
 
 ![30-second demo: 12 tests pass, 31 of 38 mutants survive, then 0 of 38 after the tests are strengthened](assets/demo.gif)
 
-<sub>Demo GIF placeholder: record `python examples/run_demo.py` (30 seconds) and save it as <code>assets/demo.gif</code>.</sub>
+<sub>The real terminal output of <a href="examples/run_demo.py"><code>examples/run_demo.py</code></a>, recorded with ffmpeg by <a href="tools/record_demo.ps1"><code>tools/record_demo.ps1</code></a>. Nothing is edited or sped up.</sub>
 
 </div>
 
@@ -86,8 +86,8 @@ Each skill ends with an **Output contract** the agent must fill with real number
 1. `git diff --unified=0` (against `HEAD`, or `--base origin/main`, untracked files included) gives the changed source lines. Test files are ignored.
 2. Mutations are applied to **those lines only**, one at a time. Python through `ast`; JavaScript/TypeScript through a comment- and string-aware line mutator.
 3. Your test command runs for each mutant, with a per-mutant timeout (a hang counts as killed).
-4. The file is restored after **every** mutant, on crashes, on `Ctrl+C` and on `SIGTERM`, byte for byte and with its original mtime. The report ends with `Source files restored: yes, byte-identical`.
-5. Survivors are printed as `file:line  mutation  | source`, with a mutation score. Exit code `1` if the score is below `--min-score` (default 80), `2` if the suite is red before mutating or no test command can be found.
+4. The file is restored after **every** mutant, on crashes, on `Ctrl+C` and on `SIGTERM`, byte for byte and with its original mtime. Even a `SIGKILL` or power cut is recoverable: originals are also backed up to a temp folder, the next run refuses to start on possibly-mutated files, and `mutation_check.py --restore` puts them back. The report ends with `Source files restored: yes, byte-identical`.
+5. Survivors are printed as `file:line  mutation  | source`, with a mutation score (`--show N` caps the list, `-v` adds killed mutants, `--json` for machines). Exit code `1` if the score is below `--min-score` (default 80), `2` if the suite is red before mutating or no test command can be found.
 
 ```bash
 python skills/mutation-check/scripts/mutation_check.py                          # diff vs HEAD, auto-detect pytest / unittest / npm test
@@ -96,7 +96,15 @@ python skills/mutation-check/scripts/mutation_check.py --files src/pricing.py   
 python skills/mutation-check/scripts/mutation_check.py --list                     # show the mutants, run nothing
 ```
 
-**Limits, stated plainly.** A surviving mutant is sometimes harmless (an *equivalent* mutant, e.g. `x <= lo` where `x == lo` returns the same value). Mark those `# pragma: no mutate` and say why. A high score means the tests notice small changes on the lines you touched; it does not mean the requirements are right. The JS/TS mutator is token-level, not a full parser: it skips what it cannot read rather than guess, and drops mutants that do not compile instead of counting them as killed.
+**Equivalent mutants.** Some survivors cannot change behaviour (`x <= lo` where `x == lo` returns the same value). Three layers handle them:
+
+1. Python mutants whose compiled bytecode is identical to the original are detected and skipped automatically (for example `0 + 0` → `0 - 0`).
+2. A survivor you have reasoned about can be accepted in `.mutation-ignore`, one line each: `file | mutation | source  # reason`. A reason is mandatory (entries without one are rejected), entries match on the source text so they survive line moves, unused entries are reported as stale, and accepted mutants are listed in every report and excluded from the score. `--print-ignore` prints fillable lines for the current survivors.
+3. `# pragma: no mutate` on a line skips it entirely.
+
+Accepting is a human (or agent) judgement, so the skill requires the reason to be stated in the final report. Never use it to hide a weak test.
+
+**Other limits, stated plainly.** A high score means the tests notice small changes on the lines you touched; it does not mean the requirements are right. The JS/TS mutator is a comment-, string- and regex-literal-aware line mutator, not a full parser: it skips what it cannot read rather than guess, and drops mutants that do not compile (checked with `node --check` for plain JS, by error signature for TS) instead of counting them as killed. Mutants run one at a time, so a slow suite means a slow check: use a fail-fast command and `--max-mutants`. `smell_scan.py` is heuristic; silence a reviewed false positive with a `honest-tests: ignore` comment on or above the line.
 
 ### Prior art
 

@@ -24,12 +24,12 @@ A green test run proves nothing until you have seen the tests go red for a real 
 
 3. **Read the survivors.** Each line is `file:line  mutation  | source`. A survivor means the suite passes with that bug in place. For every survivor, do exactly one of:
    - **Kill it:** write or tighten a test that fails when that change is applied (an exact expected value at the boundary, an assertion on the side effect, a case for the other branch). Re-run.
-   - **Justify it:** if the mutant cannot change behaviour (equivalent mutant: a dead default, a log message, a value that is overwritten), say why in one sentence and mark the line `# pragma: no mutate` (`// pragma: no mutate` in JS).
+   - **Justify it:** if the mutant cannot change behaviour (equivalent mutant: a dead default, a log message, a value that is overwritten), run with `--print-ignore`, paste its line into `.mutation-ignore` and replace `REASON` with a one-sentence reason (`file | mutation | source  # reason`; entries without a reason are rejected). Provably identical Python mutants are skipped for you. `# pragma: no mutate` on a line (`// pragma: no mutate` in JS) skips every mutant on it; prefer the ignore file because it keeps the reason.
    Never kill a survivor by editing the source, deleting the mutated line, or mocking the code.
 
 4. **Repeat until the score meets the threshold** (default 80%, `--min-score`). Then, and only then, say the tests are good.
 
-5. **Check the repo is clean.** The script reports "Source files restored: yes". Confirm with `git status` that only your intended changes remain.
+5. **Check the repo is clean.** The script reports "Source files restored: yes". Confirm with `git status` that only your intended changes remain. If a run was killed (SIGKILL, closed terminal) the next run refuses to start; run `python <skill-dir>/scripts/mutation_check.py --restore` first.
 
 ## What it does not prove
 
@@ -45,7 +45,7 @@ Mutation check: <command run>
 - Mutants: <valid> | killed <k> | survived <s> | not compiled <i>
 - Score: <pct>% (threshold <min>%)
 - Survivors fixed: <file:line mutation -> the test that now kills it>
-- Survivors justified: <file:line mutation -> why equivalent>   (or "none")
+- Survivors accepted as equivalent: <file:line mutation -> reason recorded in .mutation-ignore>   (or "none")
 - Repo restored clean: yes/no (git status checked)
 ```
 

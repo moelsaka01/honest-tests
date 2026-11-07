@@ -9,6 +9,7 @@ skipped or loosened in the same change.
     python smell_scan.py tests/ --group assertion    # only assertion findings (assertion-strength)
 
 This is a smell detector, not a proof: use mutation_check.py to prove what the tests really catch.
+A reviewed false positive can be silenced with a `honest-tests: ignore` comment on or above the line.
 Python: `ast`. JavaScript/TypeScript: a brace-matching regex scanner. Standard library only.
 Exit code 1 if any BAD finding, 0 otherwise, 2 on usage errors.
 """
@@ -364,6 +365,22 @@ def gather(paths):
     return files
 
 
+_LINES: dict = {}
+
+
+def _suppressed(f) -> bool:
+    """A reviewed false positive: `# honest-tests: ignore` (or `// ...`) on the flagged line,
+    the line above it, or the test's decorator/def line."""
+    try:
+        lines = _LINES.setdefault(f.path, Path(f.path).read_text(encoding="utf-8").splitlines())
+    except OSError:
+        return False
+    for i in (f.line - 2, f.line - 1):
+        if 0 <= i < len(lines) and "honest-tests: ignore" in lines[i]:
+            return True
+    return False
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -393,6 +410,7 @@ def main(argv=None) -> int:
     except SystemExit as e:
         print(e, file=sys.stderr)
         return 2
+    findings = [f for f in findings if not _suppressed(f)]
     if args.group != "all":
         findings = [f for f in findings if f.rule in GROUPS[args.group]]
     findings.sort(key=lambda f: (f.rule not in BAD, f.path, f.line))

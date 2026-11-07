@@ -4,21 +4,25 @@
     python examples/run_demo.py            # Python and JavaScript demos
     python examples/run_demo.py python     # only the Python one
     python examples/run_demo.py js         # only the JavaScript one (needs Node 18+)
+    python examples/run_demo.py python --pace --show 8    # typed prompts and a short report (for recording)
 
 For each demo it builds a throwaway git repo whose HEAD holds the buggy "before" code, then writes
 the bug-fixed "after" code plus a test suite into the working tree (what an agent leaves behind),
 and runs `mutation_check.py` against HEAD. Nothing in this repository is modified.
 """
+import argparse
 import hashlib
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CHECK = HERE.parent / "skills" / "mutation-check" / "scripts" / "mutation_check.py"
-PY = sys.executable if " " not in sys.executable else f'"{sys.executable}"'
+PY = "python" if shutil.which("python") else (sys.executable if " " not in sys.executable
+                                              else f'"{sys.executable}"')
 
 DEMOS = {
     "python": {"dir": "python-demo", "src": "pricing.py", "tests": "test_pricing.py",
@@ -40,7 +44,29 @@ def state(root):
     return h.hexdigest()
 
 
-def run(name):
+def typed(text, pace):
+    """Print a shell prompt line, typing it out when pacing for a recording."""
+    if not pace:
+        return
+    sys.stdout.write("\n\x1b[32m$\x1b[0m ")
+    for ch in text:
+        sys.stdout.write(ch)
+        sys.stdout.flush()
+        time.sleep(0.025)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    time.sleep(0.5)
+
+
+def banner(text, pace):
+    if pace:
+        sys.stdout.write("\x1b[2J\x1b[H")  # fresh screen per phase so the report stays in view
+    print(f"\n{'=' * 78}\n{text}\n{'=' * 78}", flush=True)
+    if pace:
+        time.sleep(1.2)
+
+
+def run(name, pace=False, show=None):
     d = DEMOS[name]
     if d["needs"] and not shutil.which(d["needs"]):
         print(f"[{name}] skipped: `{d['needs']}` not found on PATH")
@@ -57,24 +83,38 @@ def run(name):
         sh(repo, "git", "commit", "-qm", "before the fix")
         shutil.copy(src / d["src"], repo / d["src"])          # the agent's bug fix
         (repo / "tests").mkdir()
-        for label, folder in (("WEAK TESTS (what the agent wrote)", "tests_weak"),
-                              ("STRENGTHENED TESTS", "tests_strong")):
+        for label, folder in (("WEAK TESTS: what the agent wrote ('all tests pass!')", "tests_weak"),
+                              ("STRENGTHENED TESTS: after fixing every survivor", "tests_strong")):
             shutil.copy(src / folder / d["tests"], repo / "tests" / d["tests"])
-            print(f"\n{'=' * 78}\n[{name}] {label}\n{'=' * 78}", flush=True)
+            banner(f"[{name}] {label}", pace)
             before = state(repo)
-            r = subprocess.run([sys.executable, str(CHECK), "--cmd", d["cmd"]], cwd=repo)
+            if pace:
+                typed(d["cmd"], pace)
+                subprocess.run(d["cmd"], cwd=repo, shell=True)
+                time.sleep(1.5)
+            args = [sys.executable, str(CHECK), "--cmd", d["cmd"]]
+            if show is not None:
+                args += ["--show", str(show)]
+            typed(f'python mutation_check.py --cmd "{d["cmd"]}"', pace)
+            subprocess.run(args, cwd=repo)
+            if pace:
+                time.sleep(2.5)
             same = state(repo) == before
-            print(f"[{name}] working tree identical after the run: {'yes' if same else 'NO'}")
+            print(f"[{name}] working tree identical after the run: {'yes' if same else 'NO'}", flush=True)
             if not same:
                 status = 1
     return status
 
 
 if __name__ == "__main__":
-    wanted = sys.argv[1:] or list(DEMOS)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("demos", nargs="*")
+    ap.add_argument("--pace", action="store_true", help="type the commands out slowly (for recording)")
+    ap.add_argument("--show", type=int, help="list at most N survivors")
+    a = ap.parse_args()
     rc = 0
-    for n in wanted:
+    for n in a.demos or list(DEMOS):
         if n not in DEMOS:
             sys.exit(f"unknown demo {n!r}; choose from {', '.join(DEMOS)}")
-        rc |= run(n)
+        rc |= run(n, a.pace, a.show)
     sys.exit(rc)

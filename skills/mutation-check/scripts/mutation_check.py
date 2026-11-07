@@ -12,7 +12,9 @@ A survivor means no test would notice that bug.
 
 Python is mutated through `ast`; JavaScript/TypeScript through a comment/string-aware line mutator.
 Standard library only. Python 3.9+. Source files are restored after every mutant, on errors, on
-Ctrl+C and on SIGTERM. Exit codes: 0 ok, 1 score below --min-score, 2 usage/baseline problem.
+Ctrl+C and on SIGTERM; after a SIGKILL run `--restore`. Provably equivalent mutants (identical
+bytecode) are skipped; others can be accepted with a reason in `.mutation-ignore`.
+Exit codes: 0 ok, 1 score below --min-score, 2 usage/baseline problem.
 """
 from __future__ import annotations
 
@@ -34,7 +36,7 @@ import tempfile
 import time
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 LANG_BY_EXT = {
@@ -240,6 +242,10 @@ def py_apply(tree, site) -> str:
 
 # --------------------------------------------------------------------------- javascript mutator
 
+RE_BEFORE_REGEX = re.compile(r"(?:^|[(,=:\[!&|?{};]|\breturn)\s*$")
+RE_LITERAL = re.compile(r"/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n\[])+/[a-z]*")
+
+
 def mask_js(lines: list) -> list:
     """Blank out comments, strings and template literals (same length) so regexes only see code."""
     masked = []
@@ -263,6 +269,8 @@ def mask_js(lines: list) -> list:
                     out.append("_"); i += 1
             elif line.startswith("//", i):
                 out.append("_" * (n - i)); i = n
+            elif c == "/" and RE_BEFORE_REGEX.search(line[:i]) and (m := RE_LITERAL.match(line, i)):
+                out.append("_" * len(m.group(0))); i += len(m.group(0))  # regex literal
             elif line.startswith("/*", i):
                 out.append("__"); i += 2; in_block = True
             elif c in "\"'":
@@ -438,13 +446,40 @@ def detect_cmd(project: Path) -> str | None:
 
 # --------------------------------------------------------------------------- safe file handling
 
+BACKUP_PREFIX = "honest-tests-backup-"
+
+
+def pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, 0, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        k32.GetExitCodeProcess(h, ctypes.byref(code))
+        k32.CloseHandle(h)
+        return code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 class Guard:
-    """Snapshot files, write mutants, and always put the originals back (bytes and mtime)."""
+    """Snapshot files, write mutants, and always put the originals back (bytes and mtime).
+
+    Every original is also written to a backup folder with a manifest, so that even a SIGKILL or a
+    power cut can be undone with `mutation_check.py --restore`."""
 
     def __init__(self):
         self.orig: dict = {}
-        self.tmp = Path(tempfile.mkdtemp(prefix="honest-tests-backup-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix=BACKUP_PREFIX))
         self.n = 0
+        self.manifest: dict = {"pid": os.getpid(), "files": {}}
         atexit.register(self.restore_all)
 
     def snapshot(self, path: Path) -> bytes:
@@ -452,11 +487,15 @@ class Guard:
         data = path.read_bytes()
         self.orig[path] = (data, st.st_atime_ns, st.st_mtime_ns)
         self.n += 1
-        (self.tmp / f"{self.n}_{path.name}").write_bytes(data)  # last resort if we are SIGKILLed
+        name = f"{self.n}.bak"
+        (self.tmp / name).write_bytes(data)
+        self.manifest["files"][name] = {"path": str(path), "atime_ns": st.st_atime_ns,
+                                        "mtime_ns": st.st_mtime_ns}
+        (self.tmp / "manifest.json").write_text(json.dumps(self.manifest), encoding="utf-8")
         return data
 
     def write(self, path: Path, text: str, bump: int) -> None:
-        data, _, mtime = self.orig[path]
+        mtime = self.orig[path][2]
         path.write_bytes(text.encode("utf-8"))
         os.utime(path, ns=(mtime + bump * 10**9, mtime + bump * 10**9))  # defeat .pyc/cache reuse
 
@@ -481,11 +520,105 @@ class Guard:
         return ok
 
 
+def stale_backups(project: Path | None = None):
+    """Backup folders left by runs that died without restoring (process no longer alive)."""
+    for d in Path(tempfile.gettempdir()).glob(BACKUP_PREFIX + "*"):
+        try:
+            man = json.loads((d / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if man.get("pid") == os.getpid() or pid_alive(int(man.get("pid", 0))):
+            continue
+        if project is not None and not any(
+                str(project).lower() in e["path"].lower() for e in man["files"].values()):
+            continue
+        yield d, man
+
+
+def restore_stale(project: Path | None = None) -> int:
+    """Put back files from crashed runs. Returns the number of files that had been left mutated."""
+    fixed = 0
+    for d, man in list(stale_backups(project)):
+        for name, e in man["files"].items():
+            target, bak = Path(e["path"]), d / name
+            try:
+                data = bak.read_bytes()
+                if not target.exists() or target.read_bytes() != data:
+                    target.write_bytes(data)
+                    fixed += 1
+                    print(f"restored {target}")
+                os.utime(target, ns=(e["atime_ns"], e["mtime_ns"]))
+            except OSError as ex:
+                print(f"could not restore {target}: {ex}", file=sys.stderr)
+        shutil.rmtree(d, ignore_errors=True)
+    return fixed
+
+
+# --------------------------------------------------------------------------- equivalent mutants
+
+def _code_sig(code):
+    consts = tuple(_code_sig(c) if hasattr(c, "co_code") else (type(c).__name__, repr(c))
+                   for c in code.co_consts)
+    return (code.co_code, consts, code.co_names, code.co_varnames, code.co_argcount)
+
+
+def code_signature(src: str):
+    return _code_sig(compile(src, "<sig>", "exec"))
+
+
+def norm_source(line: str, lang: str) -> str:
+    """Source line without its trailing comment, so ignore entries survive comment edits."""
+    s = line.strip()
+    return re.split(r"\s+#\s" if lang == "py" else r"\s+//\s", s + " ")[0].strip()
+
+
+IGNORE_LINE = re.compile(r"^\s*(?P<file>[^|]+?)\s*\|\s*(?P<label>[^|]+?)\s*\|\s*(?P<src>.*?)\s+#\s+(?P<why>\S.*)$")
+
+
+def load_ignores(path: Path):
+    """Parse `file | mutation | source  # reason`. Entries without a reason are rejected."""
+    entries, problems = [], []
+    if not path.is_file():
+        return entries, problems
+    for n, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        m = IGNORE_LINE.match(raw)
+        if not m:
+            problems.append(f"{path.name}:{n}: needs `file | mutation | source  # reason` "
+                            f"(a reason is required): {raw.strip()[:60]}")
+            continue
+        entries.append({"file": m["file"].replace("\\", "/"), "label": re.sub(r" \(#\d+\)$", "", m["label"]),
+                        "src": m["src"], "why": m["why"], "used": False})
+    return entries, problems
+
+
+def find_ignore(entries, s):
+    label = re.sub(r" \(#\d+\)$", "", s["label"])
+    src = norm_source(s["source"], s["lang"])
+    for e in entries:
+        if e["file"] == s["file"] and e["label"] == label and e["src"] == src:
+            e["used"] = True
+            return e
+    return None
+
+
 # --------------------------------------------------------------------------- main
 
 def trunc(s: str, n: int = 78) -> str:
     s = s.strip()
     return s if len(s) <= n else s[: n - 3] + "..."
+
+
+def make_color(mode: str, enabled_for_json: bool):
+    on = (mode == "always" or (mode == "auto" and sys.stdout.isatty() and not os.environ.get("NO_COLOR"))) \
+        and not enabled_for_json
+    if on and os.name == "nt":
+        os.system("")  # switches the Windows console to ANSI mode
+
+    def c(code: str, text: str) -> str:
+        return f"\x1b[{code}m{text}\x1b[0m" if on else text
+    return c
 
 
 def main(argv=None) -> int:
@@ -503,6 +636,14 @@ def main(argv=None) -> int:
     ap.add_argument("--seed", type=int, default=0, help="sampling seed (default 0)")
     ap.add_argument("--include", action="append", default=[], help="only files matching this glob")
     ap.add_argument("--exclude", action="append", default=[], help="skip files matching this glob")
+    ap.add_argument("--ignore-file", help="accepted equivalent mutants (default <project>/.mutation-ignore)")
+    ap.add_argument("--print-ignore", action="store_true",
+                    help="print a ready-to-fill .mutation-ignore line for every survivor")
+    ap.add_argument("--show", type=int, default=30, metavar="N",
+                    help="list at most N survivors (default 30, 0 = all)")
+    ap.add_argument("--restore", action="store_true",
+                    help="undo a run that was killed (SIGKILL, power loss) and exit")
+    ap.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     ap.add_argument("--list", action="store_true", help="list mutants without running tests")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("-v", "--verbose", action="store_true", help="also list killed mutants")
@@ -514,10 +655,21 @@ def main(argv=None) -> int:
             stream.reconfigure(errors="replace")
         except Exception:
             pass
+    c = make_color(args.color, args.json)
+
+    if args.restore:
+        n = restore_stale()
+        print(f"{n} file(s) restored." if n else "Nothing to restore.")
+        return 0
 
     project = Path(args.project).resolve()
     if not project.is_dir():
         print(f"error: --project {project} is not a directory", file=sys.stderr)
+        return 2
+    leftovers = list(stale_backups(project))
+    if leftovers:
+        print("error: a previous run was killed while a mutant was on disk. Your files may still be "
+              "mutated.\nRun `mutation_check.py --restore` first.", file=sys.stderr)
         return 2
     if args.files:
         changed = {f.replace("\\", "/"): None for f in args.files}
@@ -546,8 +698,8 @@ def main(argv=None) -> int:
             targets.append((rel, path, lang, lines))
 
     log = (lambda *a: None) if args.json else print
-    log("honest-tests / mutation-check")
-    log(f"  project : {project}")
+    log(c("1", "honest-tests / mutation-check"))
+    log(f"  project : {'.' if project == Path.cwd().resolve() else project}")
     log(f"  base    : {base_desc}")
     log(f"  files   : {len(targets)} source file(s) with changes"
         + (f"; ignored {len(ignored_tests)} test file(s)" if ignored_tests else ""))
@@ -565,6 +717,11 @@ def main(argv=None) -> int:
         return 2
     log(f"  command : {cmd}")
 
+    ignore_path = Path(args.ignore_file) if args.ignore_file else project / ".mutation-ignore"
+    ignores, problems = load_ignores(ignore_path)
+    for p in problems:
+        log(c("33", f"  warning : {p}"))
+
     # Baseline: the suite must be green first, or the score means nothing.
     t0 = time.time()
     code, out, timed_out = run_cmd(cmd, project, args.timeout or 600)
@@ -576,7 +733,7 @@ def main(argv=None) -> int:
         return 2
     n_tests = count_tests(out)
     timeout = args.timeout or max(10.0, base_secs * 3)
-    log(f"  baseline: PASS" + (f", {n_tests} tests" if n_tests is not None else "")
+    log(f"  baseline: {c('32', 'PASS')}" + (f", {n_tests} tests" if n_tests is not None else "")
         + f" in {base_secs:.1f}s (mutant timeout {timeout:.0f}s)")
 
     # Enumerate mutants.
@@ -615,18 +772,22 @@ def main(argv=None) -> int:
 
     guard = Guard()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    if hasattr(signal, "SIGBREAK"):  # Ctrl+Break on Windows
+        signal.signal(signal.SIGBREAK, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     node_check = False
     results = []
+    reasons = {}
     interrupted = False
     try:
-        parsed = {}
+        parsed, sigs = {}, {}
         node = shutil.which("node")
         for rel, path, lang, _ in targets:
             guard.snapshot(path)
             if lang == "py":
                 try:
                     parsed[path] = ast.parse(guard.orig[path][0].decode("utf-8"))
-                except SyntaxError:
+                    sigs[path] = code_signature(ast.unparse(parsed[path]) + "\n")
+                except (SyntaxError, ValueError):
                     parsed[path] = None
         if node and any(s["lang"] == "js" and s["path"].suffix in (".js", ".cjs", ".mjs") for s in mutants):
             node_check = True
@@ -635,22 +796,29 @@ def main(argv=None) -> int:
             path = s["path"]
             original = guard.orig[path][0].decode("utf-8")
             status = "survived"
+            entry = find_ignore(ignores, s)
+            if entry:
+                results.append((s, "accepted"))
+                reasons[id(s)] = entry["why"]
+                continue
             try:
                 if s["lang"] == "py":
                     mutated = py_apply(copy.deepcopy(parsed[path]), s)
                     try:
                         compile(mutated, str(path), "exec")
+                        if path in sigs and code_signature(mutated) == sigs[path]:
+                            status = "equivalent"  # identical bytecode: provably cannot change behaviour
                     except (SyntaxError, ValueError):
                         status = "invalid"
                 else:
                     mutated = js_apply(original, s)
-                if status != "invalid":
+                if status == "survived":
                     guard.write(path, mutated, i)
                     if s["lang"] == "js" and node_check and path.suffix in (".js", ".cjs", ".mjs"):
                         chk = subprocess.run([node, "--check", str(path)], capture_output=True)
                         if chk.returncode != 0:
                             status = "invalid"
-                    if status != "invalid":
+                    if status == "survived":
                         code, out, timed_out = run_cmd(cmd, project, timeout)
                         if timed_out:
                             status = "timeout"
@@ -677,42 +845,73 @@ def main(argv=None) -> int:
     survived = [(s, st) for s, st in results if st == "survived"]
     killed = [(s, st) for s, st in results if st in ("killed", "timeout")]
     invalid = [(s, st) for s, st in results if st == "invalid"]
+    equivalent = [(s, st) for s, st in results if st == "equivalent"]
+    accepted = [(s, st) for s, st in results if st == "accepted"]
     valid = len(survived) + len(killed)
     score = round(100 * len(killed) / valid) if valid else None
+    stale = [e for e in ignores if not e["used"]]
 
     if args.json:
         print(json.dumps({
             "base": base_desc, "command": cmd, "baseline_tests": n_tests, "restored": restored,
             "interrupted": interrupted, "score": score, "killed": len(killed),
-            "survived": len(survived), "invalid": len(invalid), "min_score": args.min_score,
+            "survived": len(survived), "invalid": len(invalid), "equivalent": len(equivalent),
+            "accepted": len(accepted), "min_score": args.min_score,
             "mutants": [{"file": s["file"], "line": s["line"], "mutation": s["label"],
-                         "source": s["source"].strip(), "status": st} for s, st in results],
+                         "source": s["source"].strip(), "status": st,
+                         **({"reason": reasons[id(s)]} if id(s) in reasons else {})}
+                        for s, st in results],
         }, indent=2))
     else:
+        cols = shutil.get_terminal_size((110, 24)).columns
+
+        def row(s, extra=""):
+            head = f"  {s['file']}:{s['line']:<4} {s['label']:<34} | "
+            return head + trunc(s["source"], max(20, min(70, cols - len(head) - len(extra) - 1))) + extra
         if survived:
-            print(f"\nSURVIVED ({len(survived)}): every test still passed with this bug in place")
-            for s, _ in survived:
-                print(f"  {s['file']}:{s['line']:<4} {s['label']:<34} | {trunc(s['source'], 52)}")
+            shown = survived if args.show == 0 else survived[: args.show]
+            print(c("31;1", f"\nSURVIVED ({len(survived)})") + ": every test still passed with this bug in place")
+            for s, _ in shown:
+                print(c("31", row(s)))
+            if len(shown) < len(survived):
+                print(f"  ... and {len(survived) - len(shown)} more (--show 0 lists all)")
         if args.verbose and killed:
-            print(f"\nKILLED ({len(killed)})")
+            print(c("32;1", f"\nKILLED ({len(killed)})"))
             for s, st in killed:
-                print(f"  {s['file']}:{s['line']:<4} {s['label']:<34} | {trunc(s['source'], 52)}"
-                      + ("  [timeout]" if st == "timeout" else ""))
+                print(row(s, "  [timeout]" if st == "timeout" else ""))
+        if accepted:
+            print(f"\nACCEPTED as equivalent ({len(accepted)}), excluded from the score; reasons in {ignore_path.name}:")
+            for s, _ in accepted:
+                print(row(s, f"  # {reasons[id(s)]}"))
+        extras = []
+        if equivalent:
+            extras.append(f"{len(equivalent)} identical-bytecode (provably equivalent)")
         if invalid:
-            print(f"\n({len(invalid)} mutant(s) did not compile and were not counted)")
+            extras.append(f"{len(invalid)} did not compile")
+        if extras:
+            print("\nNot counted: " + ", ".join(extras) + ".")
+        for e in stale:
+            print(c("33", f"warning: unused ignore entry (code changed?): {e['file']} | {e['label']} | {e['src'][:40]}"))
         print()
         tests = f"{n_tests} tests pass, " if n_tests is not None else ""
         if score is None:
             print("Mutation score: n/a (no valid mutants)")
         else:
-            verdict = "PASS" if score >= args.min_score else "FAIL"
+            ok = score >= args.min_score
+            verdict = c("32;1", "PASS") if ok else c("31;1", "FAIL")
             print(f"{tests}{len(survived)} of {valid} mutants survived. "
                   f"Mutation score: {score}% (min {args.min_score:g}%) -> {verdict}")
-        print("Source files restored: " + ("yes, byte-identical" if restored else "NO - see warning"))
-        if survived:
-            print("\nNext: for each survivor, write or tighten a test that fails when that exact "
-                  "change is applied,\nthen re-run. Survivors that change nothing observable "
-                  "(equivalent mutants) can be\nmarked `# pragma: no mutate`; say so explicitly.")
+        print("Source files restored: " + ("yes, byte-identical" if restored else "NO - run --restore"))
+        if survived and args.print_ignore:
+            print("\nIf (and only if) a survivor cannot change behaviour, add its line to "
+                  f"{ignore_path.name} with a real reason:")
+            for s, _ in survived:
+                print(f"{s['file']} | {re.sub(r' [(]#[0-9]+[)]$', '', s['label'])} | "
+                      f"{norm_source(s['source'], s['lang'])}  # REASON")
+        elif survived:
+            print()
+            print("Next: for each survivor, write a test that fails when that exact change is applied.")
+            print("Truly equivalent? --print-ignore lists them; a recorded reason is required.")
     if interrupted:
         print("Interrupted. Files restored." if restored else "Interrupted.", file=sys.stderr)
         return 130

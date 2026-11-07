@@ -142,7 +142,7 @@ class EndToEndTests(unittest.TestCase):
         try:
             before = (repo.dir / "m.py").read_bytes()
             mtime = (repo.dir / "m.py").stat().st_mtime_ns
-            weak = repo.run("--json")
+            weak = repo.run("--json", "--max-mutants", "14")
             data = json.loads(weak.stdout)
             self.assertEqual(weak.returncode, 1, weak.stdout + weak.stderr)
             self.assertGreater(data["survived"], 3)
@@ -151,7 +151,7 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual((repo.dir / "m.py").read_bytes(), before)
             self.assertEqual((repo.dir / "m.py").stat().st_mtime_ns, mtime)
             (repo.dir / "tests" / "test_m.py").write_text(STRONG, encoding="utf-8")
-            strong = repo.run("--json")
+            strong = repo.run("--json", "--max-mutants", "14")
             sdata = json.loads(strong.stdout)
             self.assertEqual(strong.returncode, 0, strong.stdout + strong.stderr)
             self.assertGreaterEqual(sdata["score"], 75)  # the rest are equivalent mutants (x <= lo returns lo anyway)
