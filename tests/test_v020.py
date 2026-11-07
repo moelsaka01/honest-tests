@@ -142,7 +142,10 @@ class TypeScriptCheckTests(unittest.TestCase):
             (lib / "typescript.js").write_text(self.FAKE_TS, encoding="utf-8")
             sub = d / "pkg"
             sub.mkdir()
-            found = mc.find_typescript(sub)
+            from unittest import mock
+            with mock.patch.dict(os.environ):
+                os.environ.pop("HONEST_TESTS_TYPESCRIPT", None)
+                found = mc.find_typescript(sub)
             self.assertEqual(Path(found), lib / "typescript.js")
             good, bad = d / "good.ts", d / "bad.ts"
             good.write_text("const a: number = 1;\n", encoding="utf-8")

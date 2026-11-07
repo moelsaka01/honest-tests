@@ -144,21 +144,40 @@ class CrashRecoveryTests(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
-    def test_hard_kill_then_restore_flag(self):
+    def _kill_mid_mutant(self, d, original):
+        proc = self._start(d)
+        self.assertTrue(self._wait_for_mutant(d, original, proc), "mutant never written")
+        proc.kill()
+        proc.communicate(timeout=60)
+        self.assertNotEqual((d / "m.py").read_bytes(), original, "kill came too late to test")
+
+    def test_next_run_heals_a_hard_kill_by_itself(self):
         d, original = self._project()
         try:
-            proc = self._start(d)
-            self.assertTrue(self._wait_for_mutant(d, original, proc), "mutant never written")
-            proc.kill()
-            proc.communicate(timeout=60)
-            self.assertNotEqual((d / "m.py").read_bytes(), original, "kill came too late to test")
+            self._kill_mid_mutant(d, original)
+            again = subprocess.run([sys.executable, str(_paths.MUTATION_CHECK), "--files", "m.py", "--list",
+                                    "--cmd", SLOW_CMD],
+                                   cwd=d, capture_output=True, text=True)
+            self.assertEqual(again.returncode, 0, again.stderr)
+            self.assertIn("recovered 1 file(s)", again.stderr)
+            self.assertEqual((d / "m.py").read_bytes(), original)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_file_edited_after_the_kill_is_never_overwritten(self):
+        d, original = self._project()
+        try:
+            self._kill_mid_mutant(d, original)
+            time.sleep(0.05)
+            (d / "m.py").write_text("def f(a, b):\n    return a * b  # my edit\n", encoding="utf-8")
             blocked = subprocess.run([sys.executable, str(_paths.MUTATION_CHECK), "--files", "m.py",
                                       "--cmd", SLOW_CMD], cwd=d, capture_output=True, text=True)
-            self.assertEqual(blocked.returncode, 2)  # refuses to run on possibly-mutated files
+            self.assertEqual(blocked.returncode, 2)
             self.assertIn("--restore", blocked.stderr)
-            fixed = subprocess.run([sys.executable, str(_paths.MUTATION_CHECK), "--restore"], cwd=d,
-                                   capture_output=True, text=True)
-            self.assertIn("restored", fixed.stdout)
+            self.assertIn("my edit", (d / "m.py").read_text(encoding="utf-8"))
+            forced = subprocess.run([sys.executable, str(_paths.MUTATION_CHECK), "--restore"], cwd=d,
+                                    capture_output=True, text=True)
+            self.assertIn("restored", forced.stdout)
             self.assertEqual((d / "m.py").read_bytes(), original)
         finally:
             shutil.rmtree(d, ignore_errors=True)

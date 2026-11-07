@@ -581,12 +581,22 @@ def _call_stmt(toks, match, i: int):
     return "".join(parts), m
 
 
-def js_sites(src: str, changed, ts: bool = False) -> list:
-    toks = js_lex(src)
+def js_sites(src: str, changed, ts: bool = False, exclude=None) -> list:
+    """exclude: exact (start, end) character ranges that are not runtime code, from a real parser."""
+    if exclude is None:
+        toks = js_lex(src)
+    else:  # blank out types, declarations and JSX markup (same length, offsets unchanged) before lexing
+        chars = list(src)
+        for a, b in exclude:
+            for k in range(max(a, 0), min(b, len(chars))):
+                if chars[k] != "\n":
+                    chars[k] = " "
+        toks = js_lex("".join(chars))
     match = _pairs(toks)
     lines = src.split("\n")
-    skip = _skipped(toks, match, ts)
-    generic = _generics(toks) if ts else set()
+    skip = _skipped(toks, match, ts and exclude is None)
+    generic = _generics(toks) if ts and exclude is None else set()
+    ts = ts and exclude is None
     for_hdr = set()
     for i, t in enumerate(toks):
         if t.k == "id" and t.t == "for" and i + 1 < len(toks) and (i + 1) in match:
@@ -804,6 +814,7 @@ class Guard:
         self.orig: dict = {}
         self.tmp = Path(tempfile.mkdtemp(prefix=BACKUP_PREFIX))
         self.n = 0
+        self.names: dict = {}
         self.manifest: dict = {"pid": os.getpid(), "files": {}}
         atexit.register(self.restore_all)
 
@@ -813,11 +824,18 @@ class Guard:
         self.orig[path] = (data, st.st_atime_ns, st.st_mtime_ns)
         self.n += 1
         name = f"{self.n}.bak"
+        self.names[path] = name
         (self.tmp / name).write_bytes(data)
         self.manifest["files"][name] = {"path": str(path), "atime_ns": st.st_atime_ns,
                                         "mtime_ns": st.st_mtime_ns}
         (self.tmp / "manifest.json").write_text(json.dumps(self.manifest), encoding="utf-8")
         return data
+
+    def expect(self, path: Path, mutant_mtime_ns: int) -> None:
+        """Record, before a mutant is written, the mtime it will carry: after a SIGKILL this is how the
+        next run can tell a mutant of ours from a file the user has edited since."""
+        self.manifest["files"][self.names[path]]["mutant_mtime_ns"] = mutant_mtime_ns
+        (self.tmp / "manifest.json").write_text(json.dumps(self.manifest), encoding="utf-8")
 
     def write(self, path: Path, text: str, bump: int) -> None:
         mtime = self.orig[path][2]
@@ -856,8 +874,58 @@ TS_CHECK_JS = (
     "process.exit((r.diagnostics||[]).some(d=>d.category===ts.DiagnosticCategory.Error)?1:0)")
 
 
+TS_RANGES_JS = r"""
+const ts=require(process.argv[1]);const fs=require('fs');const f=process.argv[2];
+const text=fs.readFileSync(f,'utf8');
+const sf=ts.createSourceFile(f,text,ts.ScriptTarget.Latest,true,/\.[cm]?tsx$|\.jsx$/.test(f)?ts.ScriptKind.TSX:undefined);
+const out=[];const add=(a,b)=>{if(b>a)out.push([a,b])};
+const angle=a=>{if(!a||!a.length)return;const lt=text.lastIndexOf('<',a.pos);const gt=text.indexOf('>',a.end);
+  if(lt>=0)add(lt,lt+1);if(gt>=0)add(gt,gt+1)};
+const gaps=(n,keeps)=>{let p=n.getStart(sf);keeps.sort((x,y)=>x.pos-y.pos);
+  for(const k of keeps){add(p,k.getStart(sf));p=k.end}add(p,n.end)};
+const jsxExprs=n=>{const k=[];(function c(x){if(ts.isJsxExpression(x)){k.push(x);return}ts.forEachChild(x,c)})(n);return k};
+function visit(n){
+  if(ts.isInterfaceDeclaration(n)||ts.isTypeAliasDeclaration(n)||ts.isImportDeclaration(n)||
+     ts.isExportDeclaration(n)||ts.isImportEqualsDeclaration(n)||
+     ((ts.isFunctionDeclaration(n)||ts.isMethodDeclaration(n)||ts.isConstructorDeclaration(n))&&!n.body)||
+     (n.modifiers&&n.modifiers.some(m=>m.kind===ts.SyntaxKind.DeclareKeyword))){add(n.getStart(sf),n.end);return}
+  if(ts.isTypeNode(n)&&n.kind!==ts.SyntaxKind.ExpressionWithTypeArguments)add(n.getStart(sf),n.end);
+  angle(n.typeArguments);angle(n.typeParameters);
+  if(ts.isJsxText(n))add(n.getStart(sf),n.end);
+  else if(ts.isJsxOpeningElement(n)||ts.isJsxSelfClosingElement(n))gaps(n,jsxExprs(n));
+  else if(ts.isJsxClosingElement(n)||ts.isJsxOpeningFragment(n)||ts.isJsxClosingFragment(n))add(n.getStart(sf),n.end);
+  ts.forEachChild(n,visit)}
+visit(sf);
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+def ts_exclusions(node: str, tsjs: str, path: Path, src: str):
+    """Character ranges that are types, declarations or JSX markup, according to the real TypeScript
+    parser. None when it cannot be asked (then the heuristics in js_sites apply)."""
+    try:
+        r = subprocess.run([node, "-e", TS_RANGES_JS, tsjs, str(path)], capture_output=True, timeout=60)
+        if r.returncode != 0:
+            return None
+        ranges = json.loads(r.stdout.decode("utf-8"))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    if any(ord(ch) > 0xFFFF for ch in src):  # TypeScript counts UTF-16 units, Python counts code points
+        cp, n16 = [], 0
+        for ch in src:
+            cp.append(n16)
+            n16 += 2 if ord(ch) > 0xFFFF else 1
+        cp.append(n16)
+        back = {u: i for i, u in enumerate(cp)}
+        ranges = [[back.get(a, a), back.get(b, b)] for a, b in ranges]
+    return [(a, b) for a, b in ranges]
+
+
 def find_typescript(project: Path) -> str | None:
-    """The project's own TypeScript compiler, if installed (used only to reject unparseable mutants)."""
+    """The project's own TypeScript compiler, if installed (HONEST_TESTS_TYPESCRIPT overrides the search)."""
+    env = os.environ.get("HONEST_TESTS_TYPESCRIPT")
+    if env and Path(env).is_file():
+        return env
     for d in [project, *project.parents]:
         cand = d / "node_modules" / "typescript" / "lib" / "typescript.js"
         if cand.is_file():
@@ -965,6 +1033,38 @@ def restore_stale(project: Path | None = None) -> int:
                 print(f"could not restore {target}: {ex}", file=sys.stderr)
         shutil.rmtree(d, ignore_errors=True)
     return fixed
+
+
+def heal_stale(project: Path):
+    """After a hard kill (SIGKILL, power cut) put back files that are still our untouched mutants.
+    A file whose mtime is not the one we gave the mutant was edited since: it is left alone and reported.
+    Returns (files restored, backup folders that need a human decision)."""
+    fixed, refused = 0, []
+    for d, man in list(stale_backups(project)):
+        plan, safe = [], True
+        for name, e in man["files"].items():
+            target = Path(e["path"])
+            try:
+                data = (d / name).read_bytes()
+                if target.exists() and target.read_bytes() == data:
+                    continue
+                cur = target.stat().st_mtime_ns if target.exists() else None
+                ours = cur is not None and "mutant_mtime_ns" in e and abs(cur - e["mutant_mtime_ns"]) <= 1000  # exact up to filesystem rounding
+                if ours or cur is None:
+                    plan.append((target, data, e))
+                else:
+                    safe = False
+            except OSError:
+                safe = False
+        if not safe:
+            refused.append(d)
+            continue
+        for target, data, e in plan:
+            target.write_bytes(data)
+            os.utime(target, ns=(e["atime_ns"], e["mtime_ns"]))
+            fixed += 1
+        shutil.rmtree(d, ignore_errors=True)
+    return fixed, refused
 
 
 # --------------------------------------------------------------------------- equivalent mutants
@@ -1082,10 +1182,15 @@ def main(argv=None) -> int:
     if not project.is_dir():
         print(f"error: --project {project} is not a directory", file=sys.stderr)
         return 2
-    leftovers = list(stale_backups(project))
-    if leftovers:
-        print("error: a previous run was killed while a mutant was on disk. Your files may still be "
-              "mutated.\nRun `mutation_check.py --restore` first.", file=sys.stderr)
+    healed, refused = heal_stale(project)
+    if healed:
+        print(f"recovered {healed} file(s) left mutated by a run that was killed; originals put back.",
+              file=sys.stderr)
+    if refused:
+        print("error: a previous run was killed while a mutant was on disk, and a file changed since, so "
+              "I will not overwrite it on my own.\nCompare with the backup in "
+              + ", ".join(str(d) for d in refused) + " or run `mutation_check.py --restore` to force it.",
+              file=sys.stderr)
         return 2
     if args.files:
         changed = {f.replace("\\", "/"): None for f in args.files}
@@ -1153,13 +1258,21 @@ def main(argv=None) -> int:
         + f" in {base_secs:.1f}s (mutant timeout {timeout:.0f}s)")
 
     # Enumerate mutants.
+    ts_node = shutil.which("node")
+    ts_js = find_typescript(project) if ts_node else None
     mutants = []
     skipped_files = []
     for rel, path, lang, lines in targets:
         try:
             src = path.read_bytes().decode("utf-8")
-            sites = (py_sites(src, lines) if lang == "py"
-                     else js_sites(src, lines, ts=path.suffix.lower() in TS_EXT))
+            if lang == "py":
+                sites = py_sites(src, lines)
+            else:
+                is_ts = path.suffix.lower() in TS_EXT
+                excl = None
+                if ts_node and ts_js:
+                    excl = ts_exclusions(ts_node, ts_js, path, src)
+                sites = js_sites(src, lines, ts=is_ts, exclude=excl)
         except (SyntaxError, UnicodeDecodeError, ValueError) as e:
             skipped_files.append((rel, str(e).splitlines()[0] if str(e) else type(e).__name__))
             continue
@@ -1239,6 +1352,8 @@ def main(argv=None) -> int:
                 with _IO_LOCK:
                     if _ABORT.is_set():
                         raise KeyboardInterrupt
+                    if workdir is None:
+                        guard.expect(path, mtime + i * 10**9)
                     target.write_bytes(text.encode("utf-8"))
                     os.utime(target, ns=(mtime + i * 10**9, mtime + i * 10**9))  # defeat .pyc/cache reuse
 

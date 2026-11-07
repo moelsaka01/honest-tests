@@ -20,11 +20,13 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "22"
       - name: Configure git identity for the temporary test repos
         run: |
           git config --global user.email "ci@example.com"
           git config --global user.name "ci"
+      - name: Install TypeScript (only so the real-compiler tests run; the tool itself needs nothing)
+        run: npm install --no-save --no-package-lock typescript@5.6.3
       - name: Run tests (standard library only, no pip install)
         run: python -m unittest discover -s tests -v
       - name: Demo
