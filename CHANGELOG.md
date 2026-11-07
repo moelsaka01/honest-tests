@@ -3,6 +3,7 @@
 ## 0.2.0
 
 - **JS/TS mutator rewritten** as a tokenizer with bracket and statement structure (was line-based): multi-line conditions, `a<b` without spaces, `${...}` expressions, arrow bodies, brace-less `if (x) save();`, ASI-aware `return`, TypeScript generics and type-only statements. Mutants of the demo source and a deliberately tricky file are all checked with `node --check`.
+- **Type-aware TypeScript**: with the project's `typescript`, a persistent language service type-checks each mutant (the file and the files importing it) and drops the ones that no longer compile; only errors the mutant adds count (`--no-typecheck` to skip). Without TypeScript, Node's built-in type stripper (22.13+) is used for an exact parse.
 - **Real TypeScript parser when available**: if the project has `typescript` installed, it identifies types, declarations, imports and JSX markup exactly (nothing is installed or downloaded by this tool), and every TS mutant is syntax-checked with it. Tested against the real compiler in CI.
 - **`--jobs N`**: test mutants in parallel copies of the project; the project itself is never touched. Each copy is verified (suite passes; suite fails when sources are broken) and the run falls back to sequential when it cannot be trusted.
 - **Equivalent mutants**: provably identical Python mutants are skipped automatically; `.mutation-ignore` accepts reasoned survivors (reason required, stale entries reported); `# pragma: no mutate`.

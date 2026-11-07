@@ -136,7 +136,7 @@ test('10 percent from 10', () => {
 });
 """
 
-    def run_check(self, tests):
+    def run_check(self, tests, tsconfig=None):
         d = Path(tempfile.mkdtemp(prefix="ht-tse-"))
         try:
             git(d, "init", "-q")
@@ -149,6 +149,8 @@ test('10 percent from 10', () => {
             (d / "price.ts").write_text(self.SRC, encoding="utf-8")
             (d / "tests").mkdir()
             (d / "tests" / "price.test.ts").write_text(tests, encoding="utf-8")
+            if tsconfig:
+                (d / "tsconfig.json").write_text(tsconfig, encoding="utf-8")
             before = (d / "price.ts").read_bytes()
             r = subprocess.run([sys.executable, str(_paths.MUTATION_CHECK), "--json", "--cmd",
                                 "node --experimental-strip-types --no-warnings --test tests/price.test.ts"],
@@ -158,6 +160,14 @@ test('10 percent from 10', () => {
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_mutants_that_stop_type_checking_are_not_counted(self):
+        cfg = ('{"compilerOptions":{"strict":true,"noEmit":true,"target":"es2022","module":"esnext",'
+               '"moduleResolution":"bundler","allowImportingTsExtensions":true},"include":["*.ts","tests/*.ts"]}')
+        strict = self.run_check(self.WEAK, cfg)
+        loose = self.run_check(self.WEAK)
+        self.assertGreater(strict["invalid"], loose["invalid"])  # `return undefined` in a `: number` function
+        self.assertEqual(strict["survived"] + strict["killed"] + strict["invalid"], len(strict["mutants"]))
+
     def test_weak_and_strong_typescript_suites(self):
         weak = self.run_check(self.WEAK)
         self.assertLess(weak["score"], 60, weak)
@@ -166,6 +176,88 @@ test('10 percent from 10', () => {
         strong = self.run_check(self.STRONG)
         self.assertGreaterEqual(strong["score"], 85, strong)
         self.assertEqual(strong["invalid"], 0)
+
+
+@unittest.skipUnless(TSJS, "typescript is not installed")
+class TypeCheckTests(unittest.TestCase):
+    """A mutant that still parses but no longer type-checks is a compile error, not a surviving bug."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp(prefix="ht-tc-"))
+        (self.d / "tsconfig.json").write_text(
+            '{"compilerOptions":{"strict":true,"noEmit":true,"target":"es2022","module":"esnext",'
+            '"moduleResolution":"bundler"},"include":["*.ts"]}', encoding="utf-8")
+        (self.d / "a.ts").write_bytes(b"export const n: number = 1 + 1;\nexport function f(x: number): number { return x + 1; }\n")
+        (self.d / "b.ts").write_bytes(b"import { n } from './a';\nconst s: number = n;\nconst preexisting: string = 5;\n")
+        self.chk = mc.TsChecker(NODE, TSJS, self.d)
+
+    def tearDown(self):
+        self.chk.close()
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_reports_the_version_and_config(self):
+        self.assertRegex(self.chk.version, r"^\d+\.\d+")
+        self.assertTrue(self.chk.config.endswith("tsconfig.json"))
+
+    def test_harmless_mutant_adds_no_errors_and_preexisting_errors_are_ignored(self):
+        text = (self.d / "a.ts").read_text(encoding="utf-8").replace("1 + 1", "1 - 1")
+        self.assertEqual(self.chk.new_errors(self.d / "a.ts", text), [])
+
+    def test_mutant_that_breaks_its_own_types_is_caught(self):
+        text = (self.d / "a.ts").read_text(encoding="utf-8").replace("return x + 1;", "return undefined;")
+        self.assertTrue(self.chk.new_errors(self.d / "a.ts", text))
+
+    def test_mutant_that_breaks_a_file_that_imports_it_is_caught(self):
+        text = (self.d / "a.ts").read_text(encoding="utf-8").replace("n: number = 1 + 1", "n = 'x'")
+        errs = self.chk.new_errors(self.d / "a.ts", text)
+        self.assertTrue(any(e.startswith("b.ts:") for e in errs), errs)
+
+    def test_checker_leaves_no_trace_on_disk(self):
+        before = (self.d / "a.ts").read_bytes()
+        self.chk.new_errors(self.d / "a.ts", "export const n: number = 'x';\n")
+        self.assertEqual((self.d / "a.ts").read_bytes(), before)
+        self.assertEqual(self.chk.new_errors(self.d / "a.ts", before.decode("utf-8")), [])
+
+
+def node_can_strip():
+    if not NODE:
+        return False
+    return subprocess.run([NODE, "--no-warnings", "-e", "require('node:module').stripTypeScriptTypes('let a: number')"],
+                          capture_output=True).returncode == 0
+
+
+@unittest.skipUnless(node_can_strip(), "needs Node 22.13+/23.2+ (module.stripTypeScriptTypes)")
+class NodeStripTierTests(unittest.TestCase):
+    """No TypeScript installed anywhere: Node's own type stripper still gives an exact parse."""
+
+    def test_types_are_blanked_with_the_same_length(self):
+        d = Path(tempfile.mkdtemp(prefix="ht-ns-"))
+        try:
+            p = d / "a.ts"
+            src = SAMPLE_TS.split("function g<T>")[0].replace("declare function ext(a: number): void;\n", "")
+            p.write_bytes(src.encode("utf-8"))
+            blank = mc.node_strip_types(NODE, p, src)
+            self.assertIsNotNone(blank)
+            self.assertEqual(len(blank), len(src))
+            sites = mc.js_sites(src, None, ts=True, blanked=blank)
+            lines = {s["line"] for s in sites}
+            self.assertEqual(lines & {2, 3, 4, 6}, set())  # type alias, interface, overload, generic annotations
+            self.assertIn(7, lines)                        # `a < b && c > d` is still mutated
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_run_uses_the_node_tier_when_typescript_is_absent(self):
+        d = Path(tempfile.mkdtemp(prefix="ht-nr-"))
+        try:
+            (d / "p.ts").write_bytes(b"type T = { n: 5 };\nexport const f = (a: number): number => a + 1;\n")
+            env = {k: v for k, v in os.environ.items() if k != "HONEST_TESTS_TYPESCRIPT"}
+            r = subprocess.run([sys.executable, str(_paths.MUTATION_CHECK), "--files", "p.ts", "--cmd", "node -e 0", "--list"],
+                               cwd=d, capture_output=True, text=True, env=env)
+            self.assertIn("Node's built-in type stripper", r.stdout, r.stdout + r.stderr)
+            self.assertNotIn("p.ts:1 ", r.stdout)
+            self.assertIn("p.ts:2 ", r.stdout)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

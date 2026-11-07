@@ -581,9 +581,11 @@ def _call_stmt(toks, match, i: int):
     return "".join(parts), m
 
 
-def js_sites(src: str, changed, ts: bool = False, exclude=None) -> list:
+def js_sites(src: str, changed, ts: bool = False, exclude=None, blanked=None) -> list:
     """exclude: exact (start, end) character ranges that are not runtime code, from a real parser."""
-    if exclude is None:
+    if blanked is not None and len(blanked) == len(src):
+        toks, exclude = js_lex(blanked), ()
+    elif exclude is None:
         toks = js_lex(src)
     else:  # blank out types, declarations and JSX markup (same length, offsets unchanged) before lexing
         chars = list(src)
@@ -921,6 +923,122 @@ def ts_exclusions(node: str, tsjs: str, path: Path, src: str):
     return [(a, b) for a, b in ranges]
 
 
+TS_SERVER_JS = r"""
+const ts=require(process.argv[1]),fs=require('fs'),path=require('path');
+const rl=require('readline').createInterface({input:process.stdin});
+const norm=f=>f.replace(/\\/g,'/');
+const dir=norm(process.argv[2]);
+const cfgPath=ts.findConfigFile(dir,ts.sys.fileExists,'tsconfig.json');
+let options={noEmit:true,skipLibCheck:true},files=[];
+if(cfgPath){const c=ts.readConfigFile(cfgPath,ts.sys.readFile);
+  const p=ts.parseJsonConfigFileContent(c.config,ts.sys,path.dirname(cfgPath));
+  options=Object.assign({},p.options,{noEmit:true,skipLibCheck:true,incremental:false,composite:false,
+    declaration:false,declarationMap:false,emitDeclarationOnly:false});
+  delete options.tsBuildInfoFile;files=p.fileNames.map(norm)}
+const over=new Map(),ver=new Map();
+const host={getScriptFileNames:()=>files,getScriptVersion:f=>String(ver.get(norm(f))||0),
+  getScriptSnapshot:f=>{f=norm(f);const t=over.has(f)?over.get(f):(ts.sys.fileExists(f)?ts.sys.readFile(f):undefined);
+    return t===undefined?undefined:ts.ScriptSnapshot.fromString(t)},
+  getCurrentDirectory:()=>dir,getCompilationSettings:()=>options,getDefaultLibFileName:o=>ts.getDefaultLibFilePath(o),
+  fileExists:f=>over.has(norm(f))||ts.sys.fileExists(f),readFile:f=>over.has(norm(f))?over.get(norm(f)):ts.sys.readFile(f),
+  readDirectory:ts.sys.readDirectory,directoryExists:ts.sys.directoryExists,getDirectories:ts.sys.getDirectories};
+const ls=ts.createLanguageService(host,ts.createDocumentRegistry());
+let importers=null;
+function build(){importers=new Map();const prog=ls.getProgram();
+  for(const sf of prog.getSourceFiles()){if(sf.isDeclarationFile||prog.isSourceFileFromExternalLibrary(sf))continue;
+    for(const imp of ts.preProcessFile(sf.text,true,true).importedFiles){
+      const r=ts.resolveModuleName(imp.fileName,sf.fileName,options,host).resolvedModule;
+      if(r){const k=norm(r.resolvedFileName);if(!importers.has(k))importers.set(k,[]);importers.get(k).push(norm(sf.fileName))}}}}
+function keys(f){if(!importers)build();const out=[];
+  for(const g of [f,...(importers.get(f)||[])])
+    for(const d of ls.getSyntacticDiagnostics(g).concat(ls.getSemanticDiagnostics(g)))
+      out.push(path.basename(g)+':'+d.code+':'+ts.flattenDiagnosticMessageText(d.messageText,' '));
+  return out}
+const send=o=>process.stdout.write(JSON.stringify(o)+'\n');
+rl.on('line',line=>{let m;try{m=JSON.parse(line)}catch(e){return}
+  try{
+    if(m.op==='info'){send({id:m.id,version:ts.version,config:cfgPath||null});return}
+    const f=norm(m.file);if(!files.includes(f))files.push(f);
+    if(m.text!==undefined){over.set(f,m.text);ver.set(f,(ver.get(f)||0)+1)}
+    let k;try{k=keys(f)}finally{if(m.text!==undefined){over.delete(f);ver.set(f,(ver.get(f)||0)+1)}}
+    send({id:m.id,keys:k})
+  }catch(e){send({id:m.id,error:String(e&&e.stack||e)})}});
+"""
+
+
+class TsChecker:
+    """A long-lived TypeScript language service. A mutant that parses but no longer type-checks is
+    not a bug the tests could catch: it is a compile error, so it is dropped (like Stryker's checker).
+    Only errors the mutant ADDS count; the file itself and the files that import it are checked."""
+
+    def __init__(self, node: str, tsjs: str, project: Path):
+        self.p = subprocess.Popen([node, "-e", TS_SERVER_JS, tsjs, str(project)], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.lock = threading.Lock()
+        self.n = 0
+        self.base: dict = {}
+        info = self._call({"op": "info"})
+        self.version, self.config = info["version"], info["config"]
+
+    def _call(self, msg: dict) -> dict:
+        with self.lock:
+            self.n += 1
+            msg["id"] = self.n
+            self.p.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
+            self.p.stdin.flush()
+            line = self.p.stdout.readline()
+            if not line:
+                raise RuntimeError("the TypeScript checker exited")
+            r = json.loads(line)
+            if "error" in r:
+                raise RuntimeError(r["error"].splitlines()[0])
+            return r
+
+    def new_errors(self, path: Path, text: str) -> list:
+        f = str(path)
+        if f not in self.base:
+            self.base[f] = set(self._call({"op": "check", "file": f})["keys"])
+        return sorted(set(self._call({"op": "check", "file": f, "text": text})["keys"]) - self.base[f])
+
+    def close(self) -> None:
+        try:
+            self.p.stdin.close()
+            self.p.wait(5)
+        except Exception:
+            self.p.kill()
+        finally:
+            try:
+                self.p.stdout.close()
+            except Exception:
+                pass
+
+
+_STRIP_JS = ("const m=require('node:module'),fs=require('fs');"
+             "process.stdout.write(m.stripTypeScriptTypes(fs.readFileSync(process.argv[1],'utf8'),{mode:'strip'}))")
+
+
+def node_strip_types(node: str, path: Path, src: str):
+    """Node's built-in TypeScript stripper (22.13+/23.2+): the source with every type erased to blanks, same
+    length. None if unavailable, if it rejects the file (enums, JSX, ...) or if lengths would not line up."""
+    try:
+        r = subprocess.run([node, "--no-warnings", "-e", _STRIP_JS, str(path)], capture_output=True, timeout=60)
+        if r.returncode != 0:
+            return None
+        out = r.stdout.decode("utf-8")
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return None
+    return out if len(out) == len(src) else None
+
+
+def node_strip_ok(node: str, text_file: Path) -> bool:
+    """Does Node accept this (mutated) TypeScript file? Syntax only, no types."""
+    try:
+        return subprocess.run([node, "--no-warnings", "-e", _STRIP_JS, str(text_file)],
+                              capture_output=True, timeout=60).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def find_typescript(project: Path) -> str | None:
     """The project's own TypeScript compiler, if installed (HONEST_TESTS_TYPESCRIPT overrides the search)."""
     env = os.environ.get("HONEST_TESTS_TYPESCRIPT")
@@ -1149,6 +1267,8 @@ def main(argv=None) -> int:
     ap.add_argument("--jobs", type=int, default=1, metavar="N",
                     help="test mutants in N parallel copies of the project (default 1; 0 = auto). "
                          "Your files are never touched when N > 1. Needs a suite that can run twice at once.")
+    ap.add_argument("--no-typecheck", action="store_true",
+                    help="do not drop TypeScript mutants that stop type-checking")
     ap.add_argument("--seed", type=int, default=0, help="sampling seed (default 0)")
     ap.add_argument("--include", action="append", default=[], help="only files matching this glob")
     ap.add_argument("--exclude", action="append", default=[], help="skip files matching this glob")
@@ -1260,6 +1380,7 @@ def main(argv=None) -> int:
     # Enumerate mutants.
     ts_node = shutil.which("node")
     ts_js = find_typescript(project) if ts_node else None
+    tiers = set()
     mutants = []
     skipped_files = []
     for rel, path, lang, lines in targets:
@@ -1269,10 +1390,18 @@ def main(argv=None) -> int:
                 sites = py_sites(src, lines)
             else:
                 is_ts = path.suffix.lower() in TS_EXT
-                excl = None
+                excl = blank = None
                 if ts_node and ts_js:
                     excl = ts_exclusions(ts_node, ts_js, path, src)
-                sites = js_sites(src, lines, ts=is_ts, exclude=excl)
+                if excl is None and is_ts and ts_node and path.suffix.lower() in (".ts", ".mts", ".cts"):
+                    blank = node_strip_types(ts_node, path, src)
+                    if blank is not None:
+                        tiers.add("node")
+                elif excl is not None:
+                    tiers.add("typescript")
+                elif is_ts:
+                    tiers.add("heuristic")
+                sites = js_sites(src, lines, ts=is_ts, exclude=excl, blanked=blank)
         except (SyntaxError, UnicodeDecodeError, ValueError) as e:
             skipped_files.append((rel, str(e).splitlines()[0] if str(e) else type(e).__name__))
             continue
@@ -1287,6 +1416,10 @@ def main(argv=None) -> int:
     if total_found > args.max_mutants:
         mutants = random.Random(args.seed).sample(mutants, args.max_mutants)
     mutants.sort(key=lambda s: (s["file"], s["line"], s["label"]))
+    if tiers:
+        names = {"typescript": "the project's TypeScript parser", "node": "Node's built-in type stripper",
+                 "heuristic": "built-in heuristics (no TypeScript parser available)"}
+        log("  ts parse: " + " + ".join(names[k] for k in sorted(tiers)))
     log(f"  mutants : {len(mutants)}"
         + (f" (sampled from {total_found}; raise --max-mutants for all)" if total_found > len(mutants) else ""))
 
@@ -1310,6 +1443,7 @@ def main(argv=None) -> int:
         signal.signal(signal.SIGBREAK, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     node_check = False
     results = []
+    checker = None
     status_by_i = {}
     reasons = {}
     interrupted = False
@@ -1327,8 +1461,21 @@ def main(argv=None) -> int:
         if node and any(s["lang"] == "js" and s["path"].suffix in (".js", ".cjs", ".mjs") for s in mutants):
             node_check = True
         started = time.time()
-        tsjs = find_typescript(project) if node and any(
-            s["lang"] == "js" and s["path"].suffix.lower() in TS_EXT for s in mutants) else None
+        has_ts = bool(node) and any(s["lang"] == "js" and s["path"].suffix.lower() in TS_EXT for s in mutants)
+        tsjs = find_typescript(project) if has_ts else None
+        strip_ok = False
+        if has_ts and not tsjs:
+            strip_ok = subprocess.run([node, "--no-warnings", "-e", "require('node:module').stripTypeScriptTypes('let a: number')"],
+                                      capture_output=True).returncode == 0
+        if has_ts and tsjs and not args.no_typecheck:
+            try:
+                checker = TsChecker(node, tsjs, project)
+                log(f"  typecheck: TypeScript {checker.version}, "
+                    + (f"tsconfig {Path(checker.config).name}" if checker.config else "no tsconfig (defaults)")
+                    + "; mutants that stop type-checking are dropped")
+            except (OSError, RuntimeError, KeyError, ValueError) as e:
+                checker = None
+                log(c("33", f"  typecheck: unavailable ({e}); checking syntax only"))
         todo = []
         for i, s in enumerate(mutants, 1):
             entry = find_ignore(ignores, s)
@@ -1369,15 +1516,24 @@ def main(argv=None) -> int:
                         status = "invalid"
                 else:
                     mutated = js_apply(original, s)
+                    if checker is not None and path.suffix.lower() in TS_EXT:
+                        try:
+                            if checker.new_errors(path, mutated):
+                                status = "invalid"  # compiles to nothing the tests could run
+                        except RuntimeError:
+                            pass
                 if status == "survived":
                     put(mutated)
                     suffix = path.suffix.lower()
                     if s["lang"] == "js" and node_check and suffix in (".js", ".cjs", ".mjs"):
                         if subprocess.run([node, "--check", str(target)], capture_output=True).returncode != 0:
                             status = "invalid"
-                    elif s["lang"] == "js" and tsjs and suffix in TS_EXT:
+                    elif s["lang"] == "js" and tsjs and checker is None and suffix in TS_EXT:
                         if subprocess.run([node, "-e", TS_CHECK_JS, tsjs, str(target)],
                                           capture_output=True).returncode != 0:
+                            status = "invalid"
+                    elif s["lang"] == "js" and strip_ok and suffix in (".ts", ".mts", ".cts"):
+                        if not node_strip_ok(node, target):
                             status = "invalid"
                     if status == "survived":
                         code, out, timed_out = run_cmd(cmd, proj, timeout)
@@ -1476,6 +1632,8 @@ def main(argv=None) -> int:
         interrupted = True
     finally:
         restored = guard.restore_all()
+        if checker is not None:
+            checker.close()
         for wr in workroots:
             for sub_ in wr.iterdir() if wr.exists() else []:
                 remove_workdir(sub_)

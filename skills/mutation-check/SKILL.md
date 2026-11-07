@@ -33,7 +33,7 @@ A green test run proves nothing until you have seen the tests go red for a real 
 
 ## What it does not prove
 
-Mutation score measures whether tests *notice small code changes on the lines you changed*. It does not prove the tests check the right behaviour, cover untouched code, or that the requirements are correct. Python mutants come from `ast`; JS/TS mutants come from a tokenizer with bracket and statement structure, made exact by the project's own `typescript` parser when it is installed (not a type checker), so an ambiguous construct is skipped rather than guessed (the script then reports fewer mutants, never wrong ones; a mutant that does not compile is dropped, never counted as killed).
+Mutation score measures whether tests *notice small code changes on the lines you changed*. It does not prove the tests check the right behaviour, cover untouched code, or that the requirements are correct. Python mutants come from `ast`; JS/TS mutants come from a tokenizer with bracket and statement structure, made exact by the project's own `typescript` parser when it is installed, which also drops mutants that stop type-checking (`--no-typecheck` to skip), or by Node's built-in type stripper otherwise, so an ambiguous construct is skipped rather than guessed (the script then reports fewer mutants, never wrong ones; a mutant that does not compile is dropped, never counted as killed).
 
 ## Output contract
 
