@@ -1,0 +1,16 @@
+{
+  "name": "honest-tests",
+  "owner": {
+    "name": "Mohamed Elsaka"
+  },
+  "metadata": {
+    "description": "Agent skills that stop AI coding agents from shipping tests that pass no matter what."
+  },
+  "plugins": [
+    {
+      "name": "honest-tests",
+      "source": "./",
+      "description": "Agent skills that prove AI-written tests can actually fail: diff-scoped mutation testing, mock and assertion audits, red-to-green verification."
+    }
+  ]
+}

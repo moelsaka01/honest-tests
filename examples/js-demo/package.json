@@ -1,0 +1,9 @@
+{
+  "name": "honest-tests-js-demo",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "test": "node --test tests_weak/cart.test.js",
+    "test:strong": "node --test tests_strong/cart.test.js"
+  }
+}
