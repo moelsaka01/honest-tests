@@ -33,7 +33,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 __version__ = "0.2.0"
@@ -698,6 +701,18 @@ def kill_tree(p: subprocess.Popen) -> None:
             pass
 
 
+_ACTIVE: set = set()
+_ACTIVE_LOCK = threading.Lock()
+
+
+def kill_active() -> None:
+    """Kill every test process still running (Ctrl+C / console close while mutants run in parallel)."""
+    with _ACTIVE_LOCK:
+        procs = list(_ACTIVE)
+    for p in procs:
+        kill_tree(p)
+
+
 def run_cmd(cmd: str, cwd: Path, timeout: float):
     """Return (returncode or None on timeout, combined output, timed_out)."""
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", CI="1", NO_COLOR="1", FORCE_COLOR="0",
@@ -706,6 +721,8 @@ def run_cmd(cmd: str, cwd: Path, timeout: float):
         else {"start_new_session": True}
     p = subprocess.Popen(cmd, shell=True, cwd=str(cwd), stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env, **kw)
+    with _ACTIVE_LOCK:
+        _ACTIVE.add(p)
     try:
         out, _ = p.communicate(timeout=timeout)
         return p.returncode, out.decode("utf-8", "replace"), False
@@ -719,6 +736,9 @@ def run_cmd(cmd: str, cwd: Path, timeout: float):
     except BaseException:
         kill_tree(p)
         raise
+    finally:
+        with _ACTIVE_LOCK:
+            _ACTIVE.discard(p)
 
 
 def count_tests(out: str) -> int | None:
@@ -823,6 +843,94 @@ class Guard:
         else:
             sys.stderr.write(f"WARNING: could not restore every file; originals are in {self.tmp}\n")
         return ok
+
+
+# --------------------------------------------------------------------------- parallel workers, TS check
+
+_COPY_SKIP = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".cache", ".tox"}
+_LINKED = {"node_modules", ".venv", "venv"}
+TS_CHECK_JS = (
+    "const ts=require(process.argv[1]);const fs=require('fs');const f=process.argv[2];"
+    "const r=ts.transpileModule(fs.readFileSync(f,'utf8'),{fileName:f,reportDiagnostics:true,"
+    "compilerOptions:{jsx:ts.JsxEmit.Preserve}});"
+    "process.exit((r.diagnostics||[]).some(d=>d.category===ts.DiagnosticCategory.Error)?1:0)")
+
+
+def find_typescript(project: Path) -> str | None:
+    """The project's own TypeScript compiler, if installed (used only to reject unparseable mutants)."""
+    for d in [project, *project.parents]:
+        cand = d / "node_modules" / "typescript" / "lib" / "typescript.js"
+        if cand.is_file():
+            return str(cand)
+    return None
+
+
+def make_workdir(project: Path, root: Path, name: str) -> Path:
+    """A private copy of the project to run mutants in (big, reproducible dirs are linked, not copied)."""
+    dst = root / name
+    skip = _COPY_SKIP | _LINKED
+    shutil.copytree(project, dst, ignore=lambda d, names: [n for n in names if n in skip])
+    for n in _LINKED:
+        src = project / n
+        if src.is_dir():
+            link = dst / n
+            try:
+                os.symlink(src, link, target_is_directory=True)
+            except OSError:
+                if os.name == "nt":
+                    r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(src)],
+                                       capture_output=True)
+                    if r.returncode != 0:
+                        shutil.copytree(src, link)
+                else:
+                    shutil.copytree(src, link)
+    return dst
+
+
+def remove_workdir(path: Path) -> None:
+    for n in _LINKED:
+        link = path / n
+        if os.path.lexists(link):
+            try:
+                os.unlink(link)
+            except OSError:
+                try:
+                    os.rmdir(link)  # Windows junction
+                except OSError:
+                    pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+_GUARD = None
+_console_cb = None
+_IO_LOCK = threading.Lock()   # mutant writes vs. the emergency restore
+_ABORT = threading.Event()    # set once the console is being closed: never write another mutant
+
+
+def _on_console_event(event: int) -> bool:
+    """Windows closing the console window / logging off / shutting down: put the files back now."""
+    if event in (2, 5, 6):
+        with _IO_LOCK:
+            _ABORT.set()
+            if _GUARD is not None:
+                _GUARD.restore_all()
+        kill_active()
+        return True
+    return False
+
+
+def install_console_close_handler() -> None:
+    global _console_cb
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+        _console_cb = proto(lambda ev: bool(_on_console_event(ev)) and False)  # restore, then let it end
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_console_cb, True)
+    except Exception:
+        pass
 
 
 def stale_backups(project: Path | None = None):
@@ -938,6 +1046,9 @@ def main(argv=None) -> int:
                     help="exit 1 if the mutation score is below this percent (default 80)")
     ap.add_argument("--timeout", type=float, help="seconds per mutant (default max(10, 3x baseline))")
     ap.add_argument("--max-mutants", type=int, default=80, help="sample at most this many (default 80)")
+    ap.add_argument("--jobs", type=int, default=1, metavar="N",
+                    help="test mutants in N parallel copies of the project (default 1; 0 = auto). "
+                         "Your files are never touched when N > 1. Needs a suite that can run twice at once.")
     ap.add_argument("--seed", type=int, default=0, help="sampling seed (default 0)")
     ap.add_argument("--include", action="append", default=[], help="only files matching this glob")
     ap.add_argument("--exclude", action="append", default=[], help="skip files matching this glob")
@@ -1077,11 +1188,16 @@ def main(argv=None) -> int:
         return 0
 
     guard = Guard()
+    global _GUARD
+    _GUARD = guard
+    install_console_close_handler()
+    workroots = []
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     if hasattr(signal, "SIGBREAK"):  # Ctrl+Break on Windows
         signal.signal(signal.SIGBREAK, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     node_check = False
     results = []
+    status_by_i = {}
     reasons = {}
     interrupted = False
     try:
@@ -1098,15 +1214,35 @@ def main(argv=None) -> int:
         if node and any(s["lang"] == "js" and s["path"].suffix in (".js", ".cjs", ".mjs") for s in mutants):
             node_check = True
         started = time.time()
+        tsjs = find_typescript(project) if node and any(
+            s["lang"] == "js" and s["path"].suffix.lower() in TS_EXT for s in mutants) else None
+        todo = []
         for i, s in enumerate(mutants, 1):
-            path = s["path"]
-            original = guard.orig[path][0].decode("utf-8")
-            status = "survived"
             entry = find_ignore(ignores, s)
             if entry:
-                results.append((s, "accepted"))
+                status_by_i[i] = "accepted"
                 reasons[id(s)] = entry["why"]
-                continue
+            else:
+                todo.append((i, s))
+
+        def evaluate(i, s, workdir):
+            """Status of one mutant. With a workdir the mutant is written to the copy, never to the project."""
+            path = s["path"]
+            data, atime, mtime = guard.orig[path]
+            original = data.decode("utf-8")
+            if workdir is None:
+                proj, target = project, path
+            else:
+                proj, target = workdir, workdir / path.relative_to(project)
+
+            def put(text):
+                with _IO_LOCK:
+                    if _ABORT.is_set():
+                        raise KeyboardInterrupt
+                    target.write_bytes(text.encode("utf-8"))
+                    os.utime(target, ns=(mtime + i * 10**9, mtime + i * 10**9))  # defeat .pyc/cache reuse
+
+            status = "survived"
             try:
                 if s["lang"] == "py":
                     mutated = py_apply(copy.deepcopy(parsed[path]), s)
@@ -1119,13 +1255,17 @@ def main(argv=None) -> int:
                 else:
                     mutated = js_apply(original, s)
                 if status == "survived":
-                    guard.write(path, mutated, i)
-                    if s["lang"] == "js" and node_check and path.suffix in (".js", ".cjs", ".mjs"):
-                        chk = subprocess.run([node, "--check", str(path)], capture_output=True)
-                        if chk.returncode != 0:
+                    put(mutated)
+                    suffix = path.suffix.lower()
+                    if s["lang"] == "js" and node_check and suffix in (".js", ".cjs", ".mjs"):
+                        if subprocess.run([node, "--check", str(target)], capture_output=True).returncode != 0:
+                            status = "invalid"
+                    elif s["lang"] == "js" and tsjs and suffix in TS_EXT:
+                        if subprocess.run([node, "-e", TS_CHECK_JS, tsjs, str(target)],
+                                          capture_output=True).returncode != 0:
                             status = "invalid"
                     if status == "survived":
-                        code, out, timed_out = run_cmd(cmd, project, timeout)
+                        code, out, timed_out = run_cmd(cmd, proj, timeout)
                         if timed_out:
                             status = "timeout"
                         elif code == 0:
@@ -1135,16 +1275,97 @@ def main(argv=None) -> int:
                         else:
                             status = "killed"
             finally:
-                guard.restore(path)
-            results.append((s, status))
+                with _IO_LOCK:
+                    if not _ABORT.is_set():  # after a console close the emergency restore has the last word
+                        target.write_bytes(data)
+                        os.utime(target, ns=(atime, mtime))
+            return status
+
+        def tick():
             if sys.stderr.isatty() and not args.json:
-                sys.stderr.write(f"\r  testing mutant {i}/{len(mutants)} "
+                sys.stderr.write(f"\r  testing mutant {len(status_by_i)}/{len(mutants)} "
                                  f"({time.time() - started:.0f}s)   ")
                 sys.stderr.flush()
+
+        jobs = args.jobs if args.jobs > 0 else min(4, os.cpu_count() or 1)
+        jobs = max(1, min(jobs, len(todo)))
+        if jobs > 1:
+            try:
+                workroot = Path(tempfile.mkdtemp(prefix="honest-tests-work-"))
+                workroots.append(workroot)
+                log(f"  parallel: {jobs} workers (copies of the project; your files are not touched)")
+
+                def prepare(k):
+                    wd = make_workdir(project, workroot, f"w{k}")
+                    code, out, timed_out = run_cmd(cmd, wd, max(timeout, base_secs * 5))
+                    if code != 0:
+                        raise RuntimeError(f"the suite does not pass in a copy of the project (worker {k})")
+                    for _, path, lang, _ in targets:  # canary: break every target, the suite must notice
+                        (wd / path.relative_to(project)).write_text(
+                            "raise RuntimeError('honest-tests canary')\n" if lang == "py"
+                            else "throw new Error('honest-tests canary');\n", encoding="utf-8")
+                    code, out, timed_out = run_cmd(cmd, wd, max(timeout, base_secs * 5))
+                    if code == 0 and not timed_out:
+                        raise RuntimeError("the suite does not run the copied sources (installed or "
+                                           "absolute-path imports); mutants would be invisible to it")
+                    for _, path, _, _ in targets:
+                        dst = wd / path.relative_to(project)
+                        dst.write_bytes(guard.orig[path][0])
+                        os.utime(dst, ns=guard.orig[path][1:])
+                    return wd
+
+                with ThreadPoolExecutor(jobs) as ex:
+                    workdirs = list(ex.map(prepare, range(jobs)))
+            except (RuntimeError, OSError, ValueError) as e:
+                log(c("33", f"  parallel disabled: {e}; running one mutant at a time"))
+                jobs, workdirs = 1, []
+
+        if jobs > 1:
+            free = queue.Queue()
+            for wd in workdirs:
+                free.put(wd)
+            stop = threading.Event()
+
+            def task(i, s):
+                wd = free.get()
+                try:
+                    if stop.is_set():
+                        return None
+                    st = evaluate(i, s, wd)
+                    return None if stop.is_set() else st
+                finally:
+                    free.put(wd)
+
+            ex = ThreadPoolExecutor(jobs)
+            futs = {}
+            try:
+                futs = {ex.submit(task, i, s): i for i, s in todo}
+                for f in as_completed(futs):
+                    st = f.result()
+                    if st is not None:
+                        status_by_i[futs[f]] = st
+                        tick()
+            except BaseException:  # Ctrl+C, SIGTERM, console close: stop quickly
+                stop.set()
+                kill_active()
+                for f in futs:
+                    f.cancel()
+                raise
+            finally:
+                ex.shutdown(wait=True)
+        else:
+            for i, s in todo:
+                status_by_i[i] = evaluate(i, s, None)
+                tick()
     except KeyboardInterrupt:
         interrupted = True
     finally:
         restored = guard.restore_all()
+        for wr in workroots:
+            for sub_ in wr.iterdir() if wr.exists() else []:
+                remove_workdir(sub_)
+            shutil.rmtree(wr, ignore_errors=True)
+        results = [(s, status_by_i[i]) for i, s in enumerate(mutants, 1) if i in status_by_i]
         if sys.stderr.isatty() and not args.json:
             sys.stderr.write("\r" + " " * 60 + "\r")
 

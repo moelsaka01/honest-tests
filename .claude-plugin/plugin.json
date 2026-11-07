@@ -1,6 +1,6 @@
 {
   "name": "honest-tests",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Agent skills that prove AI-written tests can actually fail: diff-scoped mutation testing, mock and assertion audits, red-to-green verification.",
   "author": { "name": "Mohamed Elsaka" },
   "license": "MIT",

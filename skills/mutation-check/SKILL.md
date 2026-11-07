@@ -20,7 +20,7 @@ A green test run proves nothing until you have seen the tests go red for a real 
    python <skill-dir>/scripts/mutation_check.py --cmd "pytest -q -x" --min-score 80
    python <skill-dir>/scripts/mutation_check.py --files src/pricing.py   # no git diff: mutate whole files
    ```
-   It reads `git diff` (untracked files count), keeps only changed lines of non-test source files, applies one small mutation at a time, runs the test command with a per-mutant timeout, and restores the file after every mutant, on errors, on Ctrl+C and on SIGTERM. Use a fail-fast test command (`pytest -x`, `node --test`) to keep it quick. `--list` shows the mutants without running them; `--json` is machine-readable; `--max-mutants` (default 80) samples large diffs; `-v` also lists killed mutants.
+   It reads `git diff` (untracked files count), keeps only changed lines of non-test source files, applies one small mutation at a time, runs the test command with a per-mutant timeout, and restores the file after every mutant, on errors, on Ctrl+C and on SIGTERM. Use a fail-fast test command (`pytest -x`, `node --test`) to keep it quick. `--list` shows the mutants without running them; `--json` is machine-readable; `--max-mutants` (default 80) samples large diffs; `--jobs N` tests mutants in N verified parallel copies (only for suites that can run twice at once); `-v` also lists killed mutants.
 
 3. **Read the survivors.** Each line is `file:line  mutation  | source`. A survivor means the suite passes with that bug in place. For every survivor, do exactly one of:
    - **Kill it:** write or tighten a test that fails when that change is applied (an exact expected value at the boundary, an assertion on the side effect, a case for the other branch). Re-run.
