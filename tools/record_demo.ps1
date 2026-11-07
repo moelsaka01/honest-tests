@@ -3,7 +3,7 @@
 #   .\tools\record_demo.ps1 -Demo js
 # Only that window's visible rectangle is captured (never the whole screen). Do not touch the mouse or
 # keyboard while it runs: a terminal window appears on screen and is closed at the end.
-# Needs: ffmpeg on PATH, python on PATH, git. Output: assets/demo.gif (and demo.mp4 next to it).
+# Needs: ffmpeg on PATH, python on PATH, git. Output: assets/demo.gif.
 param(
     [ValidateSet('python', 'js')][string]$Demo = 'python',
     [int]$Show = 6,
@@ -16,7 +16,6 @@ New-Item -ItemType Directory -Force $work, (Join-Path $root 'assets') | Out-Null
 $title = "honest-tests-demo"
 $go = Join-Path $work "go.flag"; $done = Join-Path $work "done.flag"
 $mkv = Join-Path $work "demo.mkv"
-$mp4 = Join-Path $root "assets\demo.mp4"
 $gif = Join-Path $root "assets\demo.gif"
 Remove-Item $go, $done, $mkv -ErrorAction SilentlyContinue
 Remove-Item Env:NO_COLOR -ErrorAction SilentlyContinue   # let the demo show its colours
@@ -83,7 +82,6 @@ if (-not $ff.WaitForExit(20000)) { $ff.Kill() }
 Stop-Process -Id $win.Id -Force -ErrorAction SilentlyContinue
 if (-not (Test-Path $done)) { throw "demo did not finish within $TimeoutSec s" }
 
-# mkv -> mp4 (README-friendly) and a palette-optimised GIF
-ffmpeg -hide_banner -loglevel error -y -i $mkv -c:v libx264 -pix_fmt yuv420p -crf 23 $mp4
+# mkv -> palette-optimised GIF
 ffmpeg -hide_banner -loglevel error -y -i $mkv -vf "fps=8,scale=1100:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=96:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=5" -loop 0 $gif
 "{0}  {1:N1} MB" -f $gif, ((Get-Item $gif).Length / 1MB)
