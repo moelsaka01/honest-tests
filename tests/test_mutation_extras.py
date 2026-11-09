@@ -115,6 +115,38 @@ class CrashRecoveryTests(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    @unittest.skipUnless(os.name == "nt", "Windows only: closing the console is its termination request")
+    def test_console_host_dying_mid_run_restores_the_files(self):
+        """Windows has no SIGTERM from another process (os.kill maps it to TerminateProcess, which nothing can
+        catch). The nearest real, external event that can be automated is the console going away under the run:
+        end the console host that owns the child's console. The files must come back. (The CTRL_CLOSE handler
+        body is covered separately by ConsoleCloseTests; this shows the whole tool survives its console dying.)"""
+        d, original = self._project()
+        proc = None
+        try:
+            proc = subprocess.Popen([sys.executable, str(_paths.MUTATION_CHECK), "--files", "m.py",
+                                     "--cmd", SLOW_CMD, "--max-mutants", "6"], cwd=d,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    creationflags=subprocess.CREATE_NEW_CONSOLE)
+            self.assertTrue(self._wait_for_mutant(d, original, proc), "mutant never written")
+            find = (f"Get-CimInstance Win32_Process | Where-Object {{ $_.ParentProcessId -eq {proc.pid} "
+                    "-and $_.Name -match 'conhost|OpenConsole' } | ForEach-Object { $_.ProcessId }")
+            host = subprocess.run(["powershell", "-NoProfile", "-Command", find],
+                                  capture_output=True, text=True, timeout=60).stdout.split()
+            if not host:
+                self.skipTest("no private console host for the child (ConPTY / headless session)")
+            # Ending the console host is what closing its window does: attached processes get CTRL_CLOSE_EVENT.
+            subprocess.run(["taskkill", "/F", "/PID", host[0]], capture_output=True, timeout=60)
+            try:
+                proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                self.fail("process did not end after its console window was closed")
+            self.assertEqual((d / "m.py").read_bytes(), original)
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_sigterm_handler_restores_on_every_platform(self):
         """Windows cannot deliver SIGTERM from another process, but Python's handler is real there:
         raise it from inside the run, while a mutant is on disk, and check the file comes back."""
