@@ -1,0 +1,1 @@
+skills/mutation-check/scripts/mutation_check.py | `0` -> `1` | h = k32.OpenProcess(0x1000, 0, pid)  # bInheritHandle only controls whether a child process inherits the handle; this read-only liveness probe never spawns a child, so the flag cannot change the result
