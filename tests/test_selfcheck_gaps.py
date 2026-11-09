@@ -16,6 +16,7 @@ import _paths
 from test_mutation_check import SRC, STRONG, Repo, git
 
 mc = _paths.load(_paths.MUTATION_CHECK, "mutation_check")
+TSJS_PATH = mc.find_typescript(_paths.ROOT)   # the repo's own node_modules/typescript, if installed
 
 
 def labels(src, line=None, ts=False):
@@ -193,11 +194,10 @@ class CliGapTests(unittest.TestCase):
         finally:
             repo.close()
 
-    @unittest.skipIf(sys.version_info < (3, 10), "Python 3.9 keeps unreachable code, so the dead-code mutant differs")
     def test_provably_equivalent_mutants_are_reported_as_not_counted(self):
         repo = Repo(STRONG)
         try:
-            (repo.dir / "m.py").write_text(SRC + "\n\ndef dead(a):\n    return a\n    z = 5\n", encoding="utf-8")
+            (repo.dir / "m.py").write_text(SRC + "\n\ndef dead(a):\n    if False:\n        z = 5\n    return a\n", encoding="utf-8")
             out = repo.run().stdout
             self.assertIn("Not counted: ", out)
             self.assertIn("identical-bytecode (provably equivalent)", out)
@@ -260,6 +260,73 @@ class NodeCheckGapTests(unittest.TestCase):
             self.assertEqual((d / "m.js").read_text(encoding="utf-8"), "module.exports = 1 + 2;\n")
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+
+NODE = shutil.which("node")
+
+
+def node_can_strip():
+    return bool(NODE) and subprocess.run(
+        [NODE, "--no-warnings", "-e", "require('node:module').stripTypeScriptTypes('let a: number')"],
+        capture_output=True).returncode == 0
+
+
+BROKEN = {"line": 1, "label": "broken", "kind": "edits", "edits": [(0, 6, "export const = = =")]}
+TS_SRC = "export const f = (a: number) => a + 1;\n"
+
+
+class FallbackTypeCheckTests(unittest.TestCase):
+    """The two fallback syntax checks: project TypeScript without the language service, and Node's type stripper."""
+
+    def run_main(self, name, src, ts_path=None, patch_checker=False, sites=None):
+        d = Path(tempfile.mkdtemp(prefix="ht-fb-"))
+        try:
+            git(d, "init", "-q")
+            git(d, "config", "user.email", "t@example.com")
+            git(d, "config", "user.name", "t")
+            (d / name).write_text("x\n", encoding="utf-8")
+            git(d, "add", "-A")
+            git(d, "commit", "-qm", "base")
+            (d / name).write_text(src, encoding="utf-8")
+            buf = io.StringIO()
+            with contextlib.ExitStack() as st:
+                env = st.enter_context(mock.patch.dict(os.environ))
+                os.environ.pop("HONEST_TESTS_TYPESCRIPT", None)
+                if ts_path:
+                    os.environ["HONEST_TESTS_TYPESCRIPT"] = ts_path
+                if patch_checker:
+                    st.enter_context(mock.patch.object(mc, "TsChecker", side_effect=RuntimeError("no server")))
+                if sites is not None:
+                    st.enter_context(mock.patch.object(mc, "js_sites", return_value=sites))
+                st.enter_context(contextlib.redirect_stdout(buf))
+                code = mc.main(["--project", str(d), "--cmd", 'node -e "0"', "--json", "--min-score", "0"])
+            self.assertEqual(code, 0)
+            self.assertEqual((d / name).read_text(encoding="utf-8"), src)
+            return json.loads(buf.getvalue())
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    @unittest.skipUnless(NODE and TSJS_PATH, "typescript is not installed")
+    def test_transpile_check_keeps_valid_mutants_when_the_language_service_is_down(self):
+        data = self.run_main("m.ts", TS_SRC, TSJS_PATH, patch_checker=True)
+        self.assertEqual(data["invalid"], 0)
+        self.assertGreater(data["survived"], 0)
+
+    @unittest.skipUnless(NODE and TSJS_PATH, "typescript is not installed")
+    def test_transpile_check_drops_broken_mutants_when_the_language_service_is_down(self):
+        data = self.run_main("m.ts", TS_SRC, TSJS_PATH, patch_checker=True, sites=[BROKEN])
+        self.assertEqual((data["invalid"], data["survived"]), (1, 0))
+
+    @unittest.skipUnless(node_can_strip(), "needs Node 22.13+ (type stripper)")
+    def test_node_stripper_checks_ts_files_only(self):
+        ts = self.run_main("m.ts", TS_SRC)
+        self.assertEqual(ts["invalid"], 0)
+        self.assertGreater(ts["survived"], 0)
+        tsx = self.run_main("m.tsx", "export const A = (n) => <b>{n + 1}</b>;\n")   # JSX fails the stripper: .tsx must skip it
+        self.assertEqual(tsx["invalid"], 0)
+        self.assertGreater(tsx["survived"], 0)
+        broken = self.run_main("m.ts", TS_SRC, sites=[BROKEN])
+        self.assertEqual((broken["invalid"], broken["survived"]), (1, 0))
 
 
 if __name__ == "__main__":
