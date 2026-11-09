@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **smell_scan.py fixes**, found by mutation-checking our own scanner (its tests scored 43%, now 87%): `typeof`-only JS assertions were never flagged (a stray backspace had replaced `` in a regex); `@patch` decorators were counted twice, so `mock-heavy` fired at two; `assert m.called` slipped through both mock-only and weak-assert; a bare `assert f()` is now weak like `assertTrue(f())`; a snapshot-only test is no longer reported as having no assertion. New exact-expectation tests for every rule, and a repo-wide guard against control characters in source.
+
 ## 0.2.0
 
 - **JS/TS mutator rewritten** as a tokenizer with bracket and statement structure (was line-based): multi-line conditions, `a<b` without spaces, `${...}` expressions, arrow bodies, brace-less `if (x) save();`, ASI-aware `return`, TypeScript generics and type-only statements. Mutants of the demo source and a deliberately tricky file are all checked with `node --check`.

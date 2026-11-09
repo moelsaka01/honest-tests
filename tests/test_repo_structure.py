@@ -65,6 +65,28 @@ class SkillFileTests(unittest.TestCase):
         self.assertTrue((ROOT / "LICENSE").is_file())
 
 
+class SourceHygieneTests(unittest.TestCase):
+    """A stray backspace once turned a `\\b` in a regex into a control character and silently disabled a rule."""
+
+    def tracked_text_files(self):
+        out = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True).stdout.split()
+        return [ROOT / f for f in out if f.endswith((".py", ".js", ".json", ".md", ".yml", ".ps1", ".mjs"))]
+
+    def test_no_control_characters_in_source(self):
+        bad = []
+        for f in self.tracked_text_files():
+            text = f.read_text(encoding="utf-8")
+            found = sorted({hex(ord(c)) for c in text if ord(c) < 32 and c not in "\n\r\t"})
+            if found:
+                bad.append((f.relative_to(ROOT).as_posix(), found))
+        self.assertEqual(bad, [])
+
+    def test_every_python_file_compiles(self):
+        for f in self.tracked_text_files():
+            if f.suffix == ".py":
+                compile(f.read_text(encoding="utf-8"), str(f), "exec")
+
+
 class DemoTests(unittest.TestCase):
     def test_python_demo_before_vs_after(self):
         r = subprocess.run([sys.executable, str(ROOT / "examples" / "run_demo.py"), "python"],

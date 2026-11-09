@@ -84,7 +84,7 @@ def _weak_expr(e) -> bool:
     if isinstance(e, (ast.Name, ast.Attribute, ast.Subscript)):
         return True
     if isinstance(e, ast.Call):
-        return _name(e.func) in ("isinstance", "callable", "bool", "any", "all")
+        return True  # `assert f(x)` only says "truthy", the same as assertTrue(f(x))
     if isinstance(e, ast.UnaryOp) and isinstance(e.op, ast.Not):
         return _weak_expr(e.operand)
     if isinstance(e, ast.Compare) and len(e.ops) == 1:
@@ -133,7 +133,11 @@ def scan_python(path: str, src: str):
                     patch_targets.append(str(d.args[0].value))
         if any(re.search(r"(^|\.)(skip|skipif|skipunless|xfail)$", n.lower()) for n in deco_names):
             out.append(Finding(path, fn.lineno, "skipped", f"`{fn.name}` is skipped/xfail", fn.name))
+        in_decorators = {id(x) for d in fn.decorator_list for x in ast.walk(d)}
+        snaps = 0
         for node in ast.walk(fn):
+            if id(node) in in_decorators:
+                continue
             if isinstance(node, ast.Assert):
                 if _tautology(node.test):
                     tauto = True
@@ -172,6 +176,7 @@ def scan_python(path: str, src: str):
                         patch_targets.append(str(node.args[1].value))
                 elif "snapshot" in n.lower() or last in ("match", "matches_snapshot"):
                     if "snapshot" in n.lower():
+                        snaps += 1
                         out.append(Finding(path, node.lineno, "snapshot", "snapshot assertion", fn.name))
             elif isinstance(node, ast.Attribute) and node.attr in ("called", "call_count", "call_args",
                                                                     "call_args_list", "assert_called"):
@@ -185,18 +190,18 @@ def scan_python(path: str, src: str):
                     if not body_has_check:
                         out.append(Finding(path, h.lineno, "swallowed-exception",
                                            f"`{fn.name}` catches an exception and asserts nothing", fn.name))
-        total_checks = strong + weak + mock_checks
+        total_checks = strong + weak + mock_checks + snaps
         if tauto:
             out.append(Finding(path, fn.lineno, "tautology", f"`{fn.name}` asserts something always true", fn.name))
         if total_checks == 0 and not tauto and not any(f.rule == "swallowed-exception" and f.test == fn.name for f in out) \
                 and not any(f.rule == "skipped" and f.test == fn.name for f in out):
             out.append(Finding(path, fn.lineno, "no-assert", f"`{fn.name}` has no assertion", fn.name))
-        elif strong == 0 and weak > 0 and mock_checks == 0:
-            out.append(Finding(path, fn.lineno, "weak-assert",
-                               f"`{fn.name}`: every assertion is truthy/None/type-only ({weak})", fn.name))
-        elif strong == 0 and weak == 0 and mock_checks > 0:
+        elif strong == 0 and mock_checks > 0:
             out.append(Finding(path, fn.lineno, "mock-only",
                                f"`{fn.name}` only checks that mocks were called", fn.name))
+        elif strong == 0 and weak > 0:
+            out.append(Finding(path, fn.lineno, "weak-assert",
+                               f"`{fn.name}`: every assertion is truthy/None/type-only ({weak})", fn.name))
         for t in patch_targets:
             leaf = t.rsplit(".", 1)[-1]
             if leaf in called and leaf != fn.name:
@@ -254,7 +259,7 @@ def scan_js(path: str, src: str):
         strong = len(JS_STRONG.findall(block))
         mockchk = len(JS_MOCKCHK.findall(block))
         weak = max(len(JS_WEAK.findall(block)) - mockchk, 0)
-        typeof_only = len(re.findall(r"(?:assert\.\w+|expect)\(\s*typeof", block))
+        typeof_only = len(re.findall(r"(?:assert\.\w+|expect)\(\s*typeof\b", block))
         strong, weak = max(strong - typeof_only, 0), weak + typeof_only
         has_expect = bool(re.search(r"\bexpect\(|\bassert\b|\.should\b|\.expect\b", block))
         for cm in re.finditer(r"\bcatch\b[^{]*\{", block):
