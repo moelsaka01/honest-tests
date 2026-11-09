@@ -193,6 +193,7 @@ class CliGapTests(unittest.TestCase):
         finally:
             repo.close()
 
+    @unittest.skipIf(sys.version_info < (3, 10), "Python 3.9 keeps unreachable code, so the dead-code mutant differs")
     def test_provably_equivalent_mutants_are_reported_as_not_counted(self):
         repo = Repo(STRONG)
         try:
