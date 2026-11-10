@@ -39,7 +39,7 @@ import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 LANG_BY_EXT = {
