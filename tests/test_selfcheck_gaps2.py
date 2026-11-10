@@ -503,6 +503,7 @@ class RunGapTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"COLUMNS": "200"}):
             code, out, err = run_main("--project", self.d, "--files", "m.py", "--cmd", PASS_CMD, "--min-score", "0")
         self.assertEqual(code, 0, err)
+        self.assertNotIn("more (--show 0 lists all)", out)        # all four are shown: nothing is "more"
         rows = [ln for ln in out.splitlines() if ln.startswith("  m.py:2")]
         self.assertEqual(len(rows), 4)
         for ln in rows:
@@ -553,6 +554,7 @@ class RunGapTests(unittest.TestCase):
         code, out, err = run_main("--project", self.d, "--files", "a.py", "b.py", "--cmd", only_a, "--json",
                                   "--min-score", "0")
         self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines()[:2], ["{", '  "base": "--files (all lines)",'])   # indented by two
         data = json.loads(out)
         self.assertEqual({k: data[k] for k in ("killed", "survived", "invalid", "equivalent", "accepted", "score")},
                          {"killed": 3, "survived": 3, "invalid": 0, "equivalent": 0, "accepted": 0, "score": 50})
@@ -598,6 +600,183 @@ class RunGapTests(unittest.TestCase):
         self.assertLess(waited, 20, "the 40-second test processes were waited for instead of killed")
         self.assertEqual((self.d / "m.py").read_text(encoding="utf-8"), "def f(a):\n    return a + 1\n")
         self.assertEqual(list(Path(tempfile.gettempdir()).glob("honest-tests-work-*")), [])
+
+
+class FreshSampleTests(unittest.TestCase):
+    """Survivors of a second, independent sample (120 mutants that the first sample had not drawn)."""
+
+    def test_an_integer_constant_goes_one_up_and_one_down(self):
+        import ast
+        sites = mc.py_sites("x = 5\n", None)
+        self.assertEqual([(s["label"], s["value"]) for s in sites], [("`5` -> `6`", 6), ("`5` -> `4`", 4)])
+        self.assertEqual([mc.py_apply(ast.parse("x = 5\n"), s) for s in sites], ["x = 6\n", "x = 4\n"])
+
+    def test_removing_not_really_removes_it(self):
+        import ast
+        sites = mc.py_sites("x = not y\n", None)
+        self.assertEqual([s["label"] for s in sites], ["remove `not`"])
+        self.assertEqual(mc.py_apply(ast.parse("x = not y\n"), sites[0]), "x = y\n")
+
+    def test_the_character_after_a_closing_quote_is_kept(self):
+        self.assertEqual(texts("x = 'a'+b"), ["x", "=", "'a'", "+", "b"])
+
+    def test_braces_and_templates_nest_in_both_orders(self):
+        self.assertEqual(texts("`${f({a: 1})}` + 2"),      # an object literal inside a substitution
+                         ["`${", "f", "(", "{", "a", ":", "1", "}", ")", "}`", "+", "2"])
+        self.assertEqual(texts("{ x = `${a}` }"), ["{", "x", "=", "`${", "a", "}`", "}"])   # a template inside a block
+
+    def test_a_type_alias_is_skipped_and_a_statement_of_two_tokens_does_not_crash(self):
+        self.assertEqual(js_labels("type N = 1 | 2;\nx = 3\n", ts=True), ["`3` -> `4`", "`3` -> `2`"])
+        self.assertEqual(js_labels("x = 1\nfoo;"), ["`1` -> `2`", "`1` -> `0`"])
+
+    def test_a_generic_call_at_the_very_start_of_the_file(self):
+        self.assertEqual(js_labels("f<T>(x)\n", ts=True), [])
+        self.assertEqual(js_labels("a < b\n", ts=True), ["`<` -> `>=`", "`<` -> `<=`"])
+
+    def test_an_arrow_body_stops_at_the_comma_that_ends_its_argument(self):
+        self.assertEqual(mutate("f(x => x + 1, 2)\n", "arrow body -> `undefined`"), "f(x => undefined, 2)\n")
+
+    def test_what_follows_return_decides_whether_there_is_a_value_to_remove(self):
+        self.assertEqual(mutate("function f(){ return (a + b); }\n", "`return <value>` -> `return undefined`"),
+                         "function f(){ return undefined; }\n")
+        self.assertEqual(js_labels("function f(){ return; }\n"), [])
+        self.assertEqual(js_labels("function f(){ return }\n"), [])
+        self.assertEqual(js_labels("return )"), [])       # broken input: nothing to replace, and no crash
+
+
+class FreshSampleRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.proj = Path(tempfile.mkdtemp(prefix="ht-heal-"))
+        self.addCleanup(shutil.rmtree, self.proj, ignore_errors=True)
+        self.bak = Path(tempfile.mkdtemp(prefix=mc.BACKUP_PREFIX))
+        self.addCleanup(shutil.rmtree, self.bak, ignore_errors=True)
+        self.target = self.proj / "m.py"
+        self.stamp = 1_600_000_000 * 10**9
+        self.mutant_stamp = self.stamp + 5 * 10**9
+
+    def killed_run(self, off_by_ns, with_backup=True):
+        """What a run killed with a mutant on disk leaves behind; the file's mtime is off by `off_by_ns`."""
+        if with_backup:
+            (self.bak / "1.bak").write_bytes(b"x = 1\n")
+        (self.bak / "manifest.json").write_text(json.dumps({"pid": DEAD_PID, "files": {"1.bak": {
+            "path": str(self.target), "atime_ns": self.stamp, "mtime_ns": self.stamp,
+            "mutant_mtime_ns": self.mutant_stamp}}}), encoding="utf-8")
+        self.target.write_bytes(b"x = 2\n")
+        os.utime(self.target, ns=(self.mutant_stamp + off_by_ns, self.mutant_stamp + off_by_ns))
+        if self.target.stat().st_mtime_ns != self.mutant_stamp + off_by_ns:
+            self.skipTest("this filesystem does not keep timestamps to 100 ns")
+
+    def test_a_timestamp_within_a_microsecond_is_still_our_mutant(self):
+        self.killed_run(1000)
+        self.assertEqual(mc.heal_stale(self.proj), (1, []))
+        self.assertEqual(self.target.read_bytes(), b"x = 1\n")
+        self.assertEqual(self.target.stat().st_mtime_ns, self.stamp)
+        self.assertFalse(self.bak.exists())
+
+    def test_a_timestamp_further_off_means_someone_edited_the_file(self):
+        self.killed_run(1100)
+        self.assertEqual(mc.heal_stale(self.proj), (0, [self.bak]))
+        self.assertEqual(self.target.read_bytes(), b"x = 2\n")
+        self.assertTrue((self.bak / "1.bak").exists())
+
+    def test_a_backup_that_cannot_be_read_is_never_thrown_away(self):
+        self.killed_run(0, with_backup=False)
+        self.assertEqual(mc.heal_stale(self.proj), (0, [self.bak]))
+        self.assertEqual(self.target.read_bytes(), b"x = 2\n")
+        self.assertTrue((self.bak / "manifest.json").exists())
+
+    def test_guard_write_moves_the_timestamp_forward_and_restore_all_can_run_twice(self):
+        self.target.write_bytes(b"x = 1\n")
+        os.utime(self.target, ns=(self.stamp, self.stamp))
+        g = mc.Guard()
+        g.snapshot(self.target)
+        g.write(self.target, "x = 2\n", 3)
+        st = self.target.stat()                    # before the file is read, which may touch its access time
+        self.assertEqual((st.st_atime_ns, st.st_mtime_ns), (self.stamp + 3 * 10**9, self.stamp + 3 * 10**9))
+        self.assertEqual(self.target.read_bytes(), b"x = 2\n")
+        self.assertIs(g.restore_all(), True)
+        self.assertEqual((self.target.read_bytes(), self.target.stat().st_mtime_ns), (b"x = 1\n", self.stamp))
+        self.assertIs(g.restore_all(), True)       # the exit hook calls it again: the backup folder is already gone
+        self.assertFalse(g.tmp.exists())
+
+    def test_ignore_entries_drop_the_trailing_comment_of_their_own_language(self):
+        self.assertEqual(mc.norm_source("    x = a // 2  # halve\n", "py"), "x = a // 2")
+        self.assertEqual(mc.norm_source("    x = a / 2;  // halve\n", "js"), "x = a / 2;")
+        self.assertEqual(mc.norm_source("  x = h # y;\n", "js"), "x = h # y;")
+
+
+class FreshSampleCliTests(unittest.TestCase):
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp(prefix="ht-cli3-")).resolve()
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+
+    def main(self, *argv):
+        return run_main("--project", self.d, *argv)
+
+    def test_an_ignore_line_without_a_reason_is_quoted_up_to_sixty_characters(self):
+        line = "m.py | `+` -> `-` | " + "z" * 70
+        (self.d / "ig.txt").write_text(line + "\n", encoding="utf-8")
+        entries, problems = mc.load_ignores(self.d / "ig.txt")
+        self.assertEqual(entries, [])
+        self.assertEqual(problems, ["ig.txt:1: needs `file | mutation | source  # reason` (a reason is required): "
+                                    + line[:60]])
+
+    def test_thirty_survivors_are_listed_by_default(self):
+        (self.d / "m.py").write_text("".join(f"a{i} = 1\n" for i in range(16)), encoding="utf-8")
+        code, out, err = self.main("--files", "m.py", "--cmd", PASS_CMD, "--min-score", "0", "--max-mutants", "500")
+        self.assertEqual(code, 0, err)
+        self.assertIn("\nSURVIVED (32): ", out)
+        self.assertEqual(len([ln for ln in out.splitlines() if ln.startswith("  m.py:")]), 30)
+        self.assertIn("\n  ... and 2 more (--show 0 lists all)\n", out)
+
+    def test_a_failing_baseline_shows_the_last_twenty_five_lines_of_its_output(self):
+        (self.d / "m.py").write_text("x = 1\n", encoding="utf-8")
+        failing = f'"{sys.executable}" -c "[print(\'line\', i) for i in range(40)]; raise SystemExit(1)"'
+        code, out, err = self.main("--files", "m.py", "--cmd", failing)
+        self.assertEqual(code, 2)
+        self.assertEqual(err.splitlines()[-25:], [f"line {i}" for i in range(15, 40)])
+        self.assertNotIn("line 14\n", err)
+
+    def test_a_file_that_cannot_be_parsed_is_skipped_with_the_first_line_of_the_error(self):
+        (self.d / "m.py").write_text("x = 1\n", encoding="utf-8")
+        with mock.patch.object(mc, "py_sites", side_effect=ValueError("first line\nsecond line")):
+            code, out, err = self.main("--files", "m.py", "--cmd", PASS_CMD)
+        self.assertEqual(code, 0, err)
+        self.assertIn("\n  skipped : m.py (first line)\n", out)
+        self.assertIn("\n  mutants : 0\n", out)
+
+    def test_a_file_with_nothing_to_mutate_is_a_clean_exit(self):
+        (self.d / "m.py").write_text('x = "text"\n', encoding="utf-8")
+        code, out, err = self.main("--files", "m.py", "--cmd", PASS_CMD)
+        self.assertEqual(code, 0, err)
+        self.assertIn("\nNo mutable constructs on the changed lines (comments, strings, imports, config).\n", out)
+        code, out, err = self.main("--files", "m.py", "--cmd", PASS_CMD, "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out), {"score": None, "mutants": [], "note": "no mutable constructs"})
+
+    def test_javascript_is_still_mutated_when_node_is_not_installed(self):
+        (self.d / "m.js").write_text("module.exports = (a) => a + 1;\n", encoding="utf-8")
+        with mock.patch.object(mc.shutil, "which", return_value=None):
+            code, out, err = self.main("--files", "m.js", "--cmd", PASS_CMD, "--json", "--min-score", "0")
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual((data["survived"], data["invalid"], data["killed"]), (4, 0, 0))
+
+    def test_a_file_gets_its_old_timestamp_back_before_the_next_file_is_mutated(self):
+        stamp = 1_600_000_000 * 10**9
+        log = self.d / "seen.log"
+        for name, body in (("a.py", "def f():\n    return 1\n"), ("b.py", "def g():\n    return 5\n")):
+            (self.d / name).write_text(body, encoding="utf-8")
+            os.utime(self.d / name, ns=(stamp, stamp))
+        record = (f'"{sys.executable}" -c "import os; '
+                  f'open({str(log)!r}, \'a\').write(str(os.stat(\'a.py\').st_mtime_ns) + chr(10))"')
+        code, out, err = self.main("--files", "a.py", "b.py", "--cmd", record, "--min-score", "0")
+        self.assertEqual(code, 0, err)
+        seen = [int(x) for x in log.read_text(encoding="utf-8").split()]
+        self.assertEqual(len(seen), 7)                          # baseline, three mutants of a.py, three of b.py
+        self.assertEqual(seen[0], stamp)
+        self.assertTrue(all(x > stamp for x in seen[1:4]), seen)   # a mutant of a.py carries a newer timestamp
+        self.assertEqual(seen[4:], [stamp, stamp, stamp])       # while b.py is mutated, a.py is exactly as it was
 
 
 class TypeScriptHeuristicTests(unittest.TestCase):
