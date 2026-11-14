@@ -168,6 +168,7 @@ PRs welcome, especially: new mutation operators with a real bug they would have 
 
 - **[honest-ml](https://github.com/moelsaka01/honest-ml)**: stops agents from shipping leaky, unreproducible, or overclaimed ML results.
 - **honest-tests** (this repo): stops agents from shipping tests that cannot fail.
+- **[honest-done](https://github.com/moelsaka01/honest-done)**: stops agents from calling unfinished work done.
 
 ## License
 
